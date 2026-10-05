@@ -227,23 +227,6 @@ def _time_stretch_segment(
     needs_pad   = raw_tempo < MIN_TEMPO   # stretched audio shorter than window
     needs_trunc = raw_tempo > MAX_TEMPO   # compressed audio longer than window
 
-    # Log stretch ratio so we can diagnose audio quality issues
-    stretch_factor = 1.0 / raw_tempo   # >1 means audio was stretched/slowed
-    if abs(raw_tempo - 1.0) > 0.03:   # skip near-unity (already filtered above)
-        if needs_pad or needs_trunc:
-            logger.info(
-                "  Align seg: actual=%.2fs target=%.2fs ratio=%.2f "
-                "(CLAMPED from %.2f) %s",
-                actual_dur, target_duration, clamped_tempo, raw_tempo,
-                "→ silence pad" if needs_pad else "→ truncated",
-            )
-        else:
-            level = "WARNING" if stretch_factor > 1.35 or stretch_factor < 0.80 else "DEBUG"
-            getattr(logger, level.lower())(
-                "  Align seg: actual=%.2fs target=%.2fs → stretch x%.2f (tempo=%.2f)",
-                actual_dur, target_duration, stretch_factor, raw_tempo,
-            )
-
     tmp_dir = os.path.dirname(output_path) or tempfile.gettempdir()
     stretched = os.path.join(tmp_dir, "_rb_tmp_" + os.path.basename(output_path))
 

@@ -56,9 +56,9 @@ def get_default_engine(capability: str | None = None) -> str:
     if capability == "stt":
         preference = ("whisper", "gemini", "sarvam")
     elif capability == "translate":
-        preference = ("sarvam", "gcp", "gemini")
+        preference = ("gcp", "sarvam", "gemini")
     else:
-        preference = ("sarvam" , "gemini", "whisper")
+        preference = ("gemini", "whisper", "sarvam")
     for preferred in preference:
         if preferred in available:
             return preferred
@@ -109,15 +109,10 @@ ENABLE_CODE_MIXING = True          # Keep technical terms in English
 CUSTOM_GLOSSARY_PATH = None        # Path to custom glossary JSON (optional)
 GLOSSARY_CATEGORIES = None         # None = all, or list of category names
 
-# Sarvam translation mode: 'formal' | 'classic-colloquial' | 'modern-colloquial' | 'code-mixed'
-# 'code-mixed' is recommended for NPTEL lectures — keeps English technical terms
-# naturally embedded in the Hindi/Telugu/Odia translation without transliteration.
-SARVAM_TRANSLATION_MODE = "code-mixed"
-
 # ─── Pipeline Defaults ──────────────────────────────────────
 # These are used by pipeline.py and main.py when no explicit value is provided.
 DEFAULT_TARGET_LANGS  = ["hi"]     # Translate to Hindi only by default
-DEFAULT_TTS_ENGINE    = "sarvam_vc"  # Sarvam AI TTS + OpenVoice v2 voice cloning
+DEFAULT_TTS_ENGINE    = "sarvam"   # Sarvam AI TTS – best for Indian languages without GCP key
 SEPARATE_MUSIC        = True        # Always separate background music with Demucs
 ENABLE_VOICE_CLONING  = True        # Apply OpenVoice v2 tone-color transfer by default
 ENABLE_LIP_SYNC       = True       # Wav2Lip lip synchronisation (requires Wav2Lip + checkpoint)

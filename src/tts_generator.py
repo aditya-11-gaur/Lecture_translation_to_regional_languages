@@ -36,27 +36,6 @@ logger = logging.getLogger("nptel_pipeline")
 # ── Concurrency limit for TTS API calls ──────────────────────────────
 TTS_CONCURRENCY = 8
 
-
-def _get_audio_duration_fast(path: str) -> float:
-    """
-    Return audio duration in seconds using ffprobe (fast, no decoding).
-    Returns 0.0 on any error.
-    """
-    try:
-        import subprocess as _sp
-        out = _sp.run(
-            [
-                "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                path,
-            ],
-            capture_output=True, text=True, check=True,
-        )
-        return float(out.stdout.strip())
-    except Exception:
-        return 0.0
-
 # ── Estimated characters-per-second for each language (edge-tts voices) ──────
 # Used for first-pass duration estimation.  The two-pass system measures
 # real durations after the first synthesis, so these only need to be
@@ -136,7 +115,7 @@ def get_available_tts_engines() -> list[str]:
 def get_default_tts_engine() -> str:
     """Return the best available TTS engine."""
     available = get_available_tts_engines()
-    for preferred in ("sarvam_vc", "gcptts_vc", "sarvam", "gcptts", "xtts", "edge_tts"):
+    for preferred in ("gcptts_vc", "sarvam_vc", "gcptts", "sarvam", "xtts", "edge_tts"):
         if preferred in available:
             return preferred
     return "edge_tts"
@@ -675,51 +654,23 @@ def _synth_segments_sarvam(
             raw_pace = natural_dur / target_durations[idx]
             pace = max(_SARVAM_MIN_PACE, min(_SARVAM_MAX_PACE, raw_pace))
 
-        def _synth_sarvam_once(pace_val):
-            kw: dict = dict(
+        try:
+            call_kwargs: dict = dict(
                 text=text,
                 target_language_code=sarvam_code,
                 speaker=speaker,
                 model="bulbul:v3",
                 output_audio_codec="mp3",
             )
-            if pace_val is not None:
-                kw["pace"] = round(pace_val, 2)
-            return client.text_to_speech.convert(**kw)
+            if pace is not None:
+                call_kwargs["pace"] = round(pace, 2)
 
-        try:
-            resp = _synth_sarvam_once(pace)
+            resp = client.text_to_speech.convert(**call_kwargs)
             if resp.audios:
                 audio_bytes = base64.b64decode(resp.audios[0])
                 seg_path = os.path.join(out_dir, f"seg_{idx:04d}.mp3")
                 with open(seg_path, "wb") as f:
                     f.write(audio_bytes)
-
-                # ── Pass 2: measure actual duration and re-synthesise if off ──
-                target_dur = target_durations.get(idx)
-                if target_dur and target_dur > 0:
-                    actual_dur = _get_audio_duration_fast(seg_path)
-                    if actual_dur > 0:
-                        ratio = actual_dur / target_dur
-                        if ratio < _RESYNTH_THRESHOLD_LOW or ratio > _RESYNTH_THRESHOLD_HIGH:
-                            # Corrected pace: pace_pass2 = pace_pass1 * ratio
-                            corrected_pace = (pace if pace is not None else 1.0) * ratio
-                            corrected_pace = max(_SARVAM_MIN_PACE, min(_SARVAM_MAX_PACE, corrected_pace))
-                            logger.debug(
-                                "[Sarvam] Seg %d Pass 2: actual=%.2fs target=%.2fs "
-                                "ratio=%.2f → pace %.2f→%.2f",
-                                idx, actual_dur, target_dur, ratio,
-                                pace if pace is not None else 1.0, corrected_pace,
-                            )
-                            try:
-                                resp2 = _synth_sarvam_once(corrected_pace)
-                                if resp2.audios:
-                                    audio_bytes = base64.b64decode(resp2.audios[0])
-                                    with open(seg_path, "wb") as f:
-                                        f.write(audio_bytes)
-                            except Exception as exc2:
-                                logger.debug("[Sarvam] Seg %d Pass 2 failed: %s — keeping Pass 1", idx, exc2)
-
                 files[idx] = seg_path
                 logger.debug(
                     "[Sarvam] Seg %d: pace=%.2f target=%.2fs",
@@ -811,14 +762,7 @@ def _synth_segments_sarvam_vc(
     converted = convert_segments_batch(
         sarvam_files, ref_path, vc_dir, device=vc_device,
     )
-    truly_converted = sum(1 for idx, path in converted.items() if path != sarvam_files.get(idx))
-    if truly_converted == len(sarvam_files):
-        logger.info("[sarvam_vc] Voice cloning complete: %d/%d segments converted", truly_converted, len(sarvam_files))
-    else:
-        logger.warning(
-            "[sarvam_vc] Voice cloning partial: %d/%d converted, %d fell back to plain Sarvam TTS",
-            truly_converted, len(sarvam_files), len(sarvam_files) - truly_converted,
-        )
+    logger.info("[sarvam_vc] Voice cloning complete: %d/%d segments converted", len(converted), len(sarvam_files))
     return converted
 
 
@@ -1004,6 +948,79 @@ def _generate_sarvam_tts(
     return out_path
 
 
+# ── ElevenLabs TTS ────────────────────────────────────────────────────────────
+
+def _get_elevenlabs_client():
+    from elevenlabs.client import ElevenLabs
+    from config.settings import ELEVENLABS_API_KEY
+    if not ELEVENLABS_API_KEY:
+        raise ValueError("ELEVENLABS_API_KEY not set")
+    return ElevenLabs(api_key=ELEVENLABS_API_KEY)
+
+def _generate_elevenlabs_tts(
+    segments: list[Segment], lang_code: str, out_path: str
+) -> str | None:
+    """Concatenated synthesis for legacy modes."""
+    client = _get_elevenlabs_client()
+    text = " ".join(s.text for s in segments)
+    
+    # Defaulting to a pre-trained voice if custom voice cloning wasn't run
+    voice_id = "pNInz6obpgDQGcFmaJgB" # Adam (Works fairly well multilingually)
+    
+    try:
+        audio = client.text_to_speech.convert(
+            voice_id=voice_id,
+            output_format="mp3_44100_192",
+            text=text,
+            model_id="eleven_multilingual_v2"
+        )
+        with open(out_path, "wb") as w:
+            for chunk in audio:
+                if chunk:
+                    w.write(chunk)
+        return out_path
+    except Exception as e:
+        logger.error(f"ElevenLabs TTS failed: {e}")
+        return None
+
+def _synth_segments_elevenlabs(
+    segments: list[Segment],
+    lang_code: str,
+    out_dir: str,
+    preserve_fillers: bool = True,
+) -> dict[int, str]:
+    """Synthesise segments via ElevenLabs TTS."""
+    segment_files: dict[int, str] = {}
+    client = _get_elevenlabs_client()
+    
+    # In a full flow, you would dynamically create a Voice using the 'vocals.wav'
+    # For now, using a neutral stable voice for Multilingual V2
+    voice_id = "pNInz6obpgDQGcFmaJgB"
+
+    # Synchronous sequential generation to avoid strict rate limits on basic tier
+    for idx, seg in enumerate(segments):
+        out_path = os.path.join(out_dir, f"segment_{idx:03d}.mp3")
+        text = seg.text if preserve_fillers else get_text_without_fillers(seg)
+        if not text.strip():
+            continue
+            
+        try:
+            logger.debug(f"ElevenLabs generating {idx}...")
+            audio = client.text_to_speech.convert(
+                voice_id=voice_id,
+                output_format="mp3_44100_192",
+                text=text,
+                model_id="eleven_multilingual_v2"
+            )
+            with open(out_path, "wb") as w:
+                for chunk in audio:
+                    if chunk:
+                        w.write(chunk)
+            segment_files[idx] = out_path
+        except Exception as e:
+            logger.error(f"ElevenLabs failed for segment {idx}: {e}")
+            
+    return segment_files
 
 
 # ── Coqui XTTS v2 ─────────────────────────────────────────────────────────────
@@ -1388,63 +1405,29 @@ def _synth_segments_gcptts(
             "audioConfig": {"audioEncoding": "MP3", "sampleRateHertz": 24000},
         }
 
-        import requests as _req
-        import time as _time
-        import base64 as _b64
+        try:
+            import requests as _req
+            import time as _time
 
-        def _gcp_synth_once(rate_pct_val):
-            ssml_text_local = (text
-                .replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
-                .replace('"', "&quot;"))
-            ssml_local = f'<speak><prosody rate="{rate_pct_val}%">{ssml_text_local}</prosody></speak>'
-            pl = {
-                "input": {"ssml": ssml_local},
-                "voice": {"languageCode": bcp47, "name": voice_name},
-                "audioConfig": {"audioEncoding": "MP3", "sampleRateHertz": 24000},
-            }
-            last_exc_inner = None
+            last_exc = None
+            data = None
             for _attempt in range(3):
                 try:
-                    r = _req.post(url, json=pl, timeout=20)
-                    r.raise_for_status()
-                    return r.json()
+                    resp = _req.post(url, json=payload, timeout=20)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    break
                 except Exception as _e:
-                    last_exc_inner = _e
+                    last_exc = _e
                     if _attempt < 2:
                         _time.sleep(2 ** _attempt)
-            raise last_exc_inner
-
-        try:
-            data = _gcp_synth_once(rate_pct)
+            if data is None:
+                raise last_exc
+            import base64 as _b64
             audio_bytes = _b64.b64decode(data["audioContent"])
             seg_path = os.path.join(out_dir, f"gcpseg_{idx:04d}.mp3")
             with open(seg_path, "wb") as fh:
                 fh.write(audio_bytes)
-
-            # ── Pass 2: measure actual duration and re-synthesise if off ──
-            target_dur = target_durations.get(idx)
-            if target_dur and target_dur > 0:
-                actual_dur = _get_audio_duration_fast(seg_path)
-                if actual_dur > 0:
-                    ratio = actual_dur / target_dur
-                    if ratio < _RESYNTH_THRESHOLD_LOW or ratio > _RESYNTH_THRESHOLD_HIGH:
-                        raw_rate2 = rate_pct * ratio
-                        rate_pct2 = int(max(_GCP_MIN_RATE_PCT, min(_GCP_MAX_RATE_PCT, raw_rate2)))
-                        logger.debug(
-                            "[GCP TTS] Seg %d Pass 2: actual=%.2fs target=%.2fs "
-                            "ratio=%.2f → rate %d%%→%d%%",
-                            idx, actual_dur, target_dur, ratio, rate_pct, rate_pct2,
-                        )
-                        try:
-                            data2 = _gcp_synth_once(rate_pct2)
-                            audio_bytes2 = _b64.b64decode(data2["audioContent"])
-                            with open(seg_path, "wb") as fh:
-                                fh.write(audio_bytes2)
-                        except Exception as exc2:
-                            logger.debug("[GCP TTS] Seg %d Pass 2 failed: %s — keeping Pass 1", idx, exc2)
-
             files[idx] = seg_path
             logger.debug("[GCP TTS] Seg %d: rate=%d%% target=%.1fs text='%s…'",
                          idx, rate_pct, target_durations.get(idx, 0), text[:40])

@@ -238,7 +238,7 @@ def generate_glossary_from_transcript(
     segments,
     *,
     gemini_api_key: str | None = None,
-    model: str = "gemini-3.6-flash",
+    model: str = "gemini-2.5-flash",
     fallback_to_static: bool = True,
 ) -> Glossary:
     """

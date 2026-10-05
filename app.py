@@ -174,24 +174,14 @@ with st.sidebar:
 
     st.divider()
     _ov_available = is_openvoice_available()
-    # _vc engines handle voice cloning internally — no need for Stage 2 expander
-    _tts_engine_has_vc = tts_engine is not None and tts_engine.endswith("_vc")
     with st.expander("🎙️ Voice Cloning (Stage 2)", expanded=False):
         st.markdown(
             "**Stage 1** — Language-correct dubbed speech (Sarvam / edge-tts)  \n"
             "**Stage 2** — Tone-color transfer: makes the dubbed voice **sound like** the original lecturer.  \n"
         )
+        
         st.divider()
-        if _tts_engine_has_vc:
-            enable_voice_cloning = False
-            st.info(
-                "✅ **Voice cloning is already included** in the selected TTS engine "
-                f"(`{tts_engine}`).  \n\n"
-                "The engine synthesises speech **and** applies OpenVoice v2 tone-color "
-                "transfer in a single step — no separate Stage 2 pass needed.",
-                icon="ℹ️",
-            )
-        elif _ov_available:
+        if _ov_available:
             enable_voice_cloning = st.checkbox(
                 "Enable Stage 2: Voice Cloning",
                 value=True,
@@ -386,8 +376,7 @@ if uploaded_file is not None:
                 do_tts=do_tts,
                 tts_engine=tts_engine,
                 separate_music=separate_music,
-                voice_profile=None,  # Legacy
-                enable_voice_cloning=enable_voice_cloning,
+                voice_profile=None,  # Legacy 
                 enable_prosody=enable_prosody,
                 enable_glossary=enable_glossary,
                 enable_enhancer=enable_enhancer,

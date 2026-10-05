@@ -462,8 +462,6 @@ def convert_segments_batch(
     Returns:
         Updated ``{segment_idx: converted_path}`` mapping.
     """
-    global _converter_cache, _target_se_cache, _resemblyzer_encoder  # may be reset on CUDA-not-available
-
     if not is_openvoice_available():
         logger.warning("[OpenVoice] Library not installed — skipping per-segment conversion")
         return segment_files
@@ -498,9 +496,8 @@ def convert_segments_batch(
                     device=device,
                 )
             except RuntimeError as cuda_exc:
-                err_str = str(cuda_exc).lower()
-                # CUDA OOM — free memory and retry on same device
-                if "out of memory" in err_str and device == "cuda":
+                # CUDA OOM — aggressively free memory, then retry once on same device
+                if "out of memory" in str(cuda_exc).lower() and device == "cuda":
                     logger.warning(
                         "[OpenVoice] Seg %d CUDA OOM — freeing cache and retrying", idx
                     )
@@ -511,20 +508,6 @@ def convert_segments_batch(
                         torch.cuda.ipc_collect()
                     except Exception:
                         pass
-                    convert_voice(
-                        tts_audio_path=seg_path,
-                        reference_audio_path=reference_audio_path,
-                        output_path=out_path,
-                        device=device,
-                    )
-                # No CUDA device detected — reset singleton and fall back to CPU
-                elif "no cuda-capable device" in err_str or "cuda failed" in err_str:
-                    logger.warning(
-                        "[OpenVoice] Seg %d: CUDA unavailable — reloading converter on CPU and retrying",
-                        idx,
-                    )
-                    _converter_cache = None  # force reload on CPU
-                    device = "cpu"
                     convert_voice(
                         tts_audio_path=seg_path,
                         reference_audio_path=reference_audio_path,
@@ -555,6 +538,7 @@ def convert_segments_batch(
         logger.info("[OpenVoice] All %d segments converted successfully", total)
 
     # GPU / cache cleanup — release everything before Wav2Lip or next stage uses the GPU
+    global _converter_cache, _target_se_cache, _resemblyzer_encoder
     try:
         import gc, torch
         if _converter_cache is not None:
