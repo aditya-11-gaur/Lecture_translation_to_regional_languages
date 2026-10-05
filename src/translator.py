@@ -28,12 +28,45 @@ from config.settings import (
     GCP_API_KEY,
     TARGET_LANGUAGES,
     ENABLE_CODE_MIXING,
+    SARVAM_TRANSLATION_MODE,
 )
 from src.transcriber import Segment
 from src.glossary import Glossary, generate_glossary_from_transcript, load_default_glossary, verify_terms_preserved
 from src.utils import retry_on_failure
 
 logger = logging.getLogger("nptel_pipeline")
+
+# ── Duration ratio estimation ─────────────────────────────────────────────────
+# Characters-per-second at a natural speaking pace for each script.
+# English: ~14 chars/sec (Latin, short words)
+# Hindi Devanagari: ~5.5 chars/sec  (more chars per phoneme)
+# Telugu / Odia: ~5.0 chars/sec
+_SPOKEN_CPS: dict[str, float] = {
+    "en": 14.0,
+    "hi": 5.5,
+    "te": 5.0,
+    "od": 5.0,
+}
+
+def _estimate_duration_ratio(
+    source_text: str,
+    translated_text: str,
+    source_lang: str = "en",
+    target_lang: str = "hi",
+) -> float:
+    """
+    Estimate how much longer (ratio > 1.0) or shorter (ratio < 1.0) the
+    translated speech will be compared to the source speech.
+
+    Based on character length and empirical chars-per-second speaking rates.
+    A ratio of 1.2 means the translation will take ~20% longer to speak.
+    """
+    src_cps = _SPOKEN_CPS.get(source_lang, 14.0)
+    tgt_cps = _SPOKEN_CPS.get(target_lang, 5.5)
+    src_dur = max(len(source_text.strip()), 1) / src_cps
+    tgt_dur = max(len(translated_text.strip()), 1) / tgt_cps
+    return tgt_dur / src_dur
+
 
 
 # ── Maximum segments per Gemini batch call ────────────────────────────────────
@@ -138,7 +171,14 @@ def _translate_batch_gemini(
     # Process in batches
     for batch_start in range(0, len(segments), _BATCH_SIZE):
         batch = segments[batch_start : batch_start + _BATCH_SIZE]
-        batch_texts = [{"id": i, "text": seg.text} for i, seg in enumerate(batch)]
+        batch_texts = [
+            {
+                "id": i,
+                "text": seg.text,
+                "duration_s": round(seg.end - seg.start, 2),
+            }
+            for i, seg in enumerate(batch)
+        ]
 
         prompt = f"""Translate the following English text segments into {lang_name}.
 
@@ -152,7 +192,7 @@ Rules:
 - Do NOT repeat words or phrases. Each sentence should be concise without redundancy.
 - Do NOT add filler translations or paraphrase the same idea multiple times.
 - Keep the same number of segments as input.
-- The translated text should be roughly similar in length to the source English text.
+- IMPORTANT: Each segment has a "duration_s" field — the number of seconds the original speaker took. Your translation should be speakable in approximately that many seconds at a natural conversational pace. Prefer concise, fluent phrasing that fits this time budget. Do not pad with extra words.
 - Return ONLY the JSON array, nothing else.{code_mix_section}
 
 Input segments:
@@ -167,7 +207,7 @@ Input segments:
         )
         def _call_gemini(p):
             return client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.6-flash",
                 contents=p,
                 config=types.GenerateContentConfig(
                     temperature=0.2,
@@ -308,11 +348,14 @@ def _translate_batch_sarvam(
             translated.append(Segment(start=seg.start, end=seg.end, text=""))
             continue
 
-        # Protect technical terms before handing text to Sarvam.
-        # Sarvam is a direct translation API (no custom prompt), so we
-        # substitute glossary terms with opaque placeholder tokens that the
-        # MT engine will leave untouched, then restore them afterwards.
-        protected_text, placeholder_map = _protect_terms(text, glossary, terms_in_use)
+        # In code-mixed mode, Sarvam natively keeps English technical terms —
+        # placeholder protection is not needed and would degrade quality.
+        # For other modes, apply placeholder protection as a safety net.
+        use_code_mixed = SARVAM_TRANSLATION_MODE == "code-mixed"
+        if use_code_mixed:
+            protected_text, placeholder_map = text, {}
+        else:
+            protected_text, placeholder_map = _protect_terms(text, glossary, terms_in_use)
 
         @retry_on_failure(
             max_retries=2, backoff_base=2.0,
@@ -324,6 +367,7 @@ def _translate_batch_sarvam(
                 source_language_code="en-IN",
                 target_language_code=sarvam_code,
                 model="mayura:v1",
+                mode=SARVAM_TRANSLATION_MODE,
             )
 
         try:
@@ -331,15 +375,16 @@ def _translate_batch_sarvam(
             new_text = resp.translated_text or protected_text
         except Exception as exc:
             logger.warning("Sarvam error on segment %d: %s", i + 1, exc)
-            new_text = text  # keep original on failure; no placeholders to restore
+            new_text = text  # keep original on failure
             placeholder_map = {}
             fallback_count += 1
 
-        # Restore placeholders → original English terms
-        new_text = _restore_terms(new_text, placeholder_map)
+        # Restore placeholders for non-code-mixed modes
+        if not use_code_mixed:
+            new_text = _restore_terms(new_text, placeholder_map)
 
-        # Log any terms that still got transliterated despite protection
-        if glossary and terms_in_use:
+        # Log any terms that still got transliterated
+        if not use_code_mixed and glossary and terms_in_use:
             missing = verify_terms_preserved(text, new_text, glossary)
             if missing:
                 logger.debug(
@@ -347,6 +392,15 @@ def _translate_batch_sarvam(
                     i, missing,
                 )
 
+        seg_duration = seg.end - seg.start
+        if seg_duration > 0:
+            ratio = _estimate_duration_ratio(text, new_text, "en", target_lang)
+            if ratio > 1.20 or ratio < 0.80:
+                logger.debug(
+                    "[Sarvam] Seg %d duration ratio=%.2f (%.1fs src → est %.1fs tts) "
+                    "— may need FFmpeg stretch",
+                    i, ratio, seg_duration, seg_duration * ratio,
+                )
         translated.append(Segment(start=seg.start, end=seg.end, text=new_text))
 
         if (i + 1) % 50 == 0:
