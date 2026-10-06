@@ -50,6 +50,40 @@ st.set_page_config(
     layout="wide",
 )
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Authentication Gate
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+import hmac
+
+def check_password():
+    """Returns `True` if the user had the correct password."""
+    def password_entered():
+        # Read from .env or default to "btpdemo"
+        expected_password = os.environ.get("APP_PASSWORD", "btpdemo")
+        if hmac.compare_digest(st.session_state["password"], expected_password):
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]  # don't store password
+        else:
+            st.session_state["password_correct"] = False
+
+    if st.session_state.get("password_correct", False):
+        return True
+
+    st.markdown("<h2 style='text-align: center; margin-top: 50px;'>🔒 Access Restricted</h2>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center;'>Please enter the access password to use the NPTEL pipeline.</p>", unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.text_input(
+            "Password", type="password", on_change=password_entered, key="password"
+        )
+        if "password_correct" in st.session_state:
+            st.error("😕 Password incorrect")
+    return False
+
+if not check_password():
+    st.stop()
+
 # ── Custom CSS ─────────────────────────────────────────────────
 st.markdown(
     """
@@ -245,7 +279,7 @@ with st.sidebar:
         if _wav2lip_available:
             enable_lip_sync = st.checkbox(
                 "Enable Lip Synchronisation",
-                value=True,
+                value=False,
                 help=(
                     "Produces one MP4 per target language where the speaker's lips "
                     "are animated to match the dubbed audio. "
@@ -256,7 +290,7 @@ with st.sidebar:
         elif _wav2lip_repo_present:
             enable_lip_sync = st.checkbox(
                 "Enable Lip Synchronisation",
-                value=True,
+                value=False,
                 help=(
                     "Wav2Lip repo found. Checkpoints will be downloaded automatically "
                     "(~500 MB, one-time) when lip sync first runs."
@@ -269,7 +303,7 @@ with st.sidebar:
         else:
             enable_lip_sync = st.checkbox(
                 "Enable Lip Synchronisation (audio-swap only)",
-                value=True,
+                value=False,
                 help=(
                     "Wav2Lip not found — will only swap the audio track. "
                     "Install Wav2Lip with its checkpoint for actual facial animation."
@@ -300,74 +334,148 @@ with st.sidebar:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Main area – file upload
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-col_upload, col_info = st.columns([2, 1])
 
-with col_upload:
-    uploaded_file = st.file_uploader(
-        "Upload a lecture video",
-        type=["mp4", "mkv", "avi", "webm", "mov"],
-        help="Supported formats: MP4, MKV, AVI, WebM, MOV",
-    )
+tab_run, tab_history = st.tabs(["🚀 Run Pipeline", "📂 Past Results"])
 
-with col_info:
-    st.markdown("##### How it works")
-    st.markdown(
-        """
-        1. **Upload** your NPTEL lecture video  
-        2. **Configure** options in the sidebar  
-        3. **Click Run** and wait for results  
-        4. **Download** subtitles & audio  
-        """
-    )
+# ── Past Results Tab ────────────────────────────────────────────────────────
+with tab_history:
+    st.markdown("### 📂 Previously Processed Videos")
+    st.write("Browse and download videos you have already processed without using GPU/API resources.")
+    
+    if os.path.exists(OUTPUT_DIR):
+        jobs = [d for d in os.listdir(OUTPUT_DIR) if os.path.isdir(os.path.join(OUTPUT_DIR, d))]
+        if jobs:
+            for job_name in sorted(jobs, reverse=True):
+                job_dir = os.path.join(OUTPUT_DIR, job_name)
+                # Check for MKVs
+                mkvs = [f for f in os.listdir(job_dir) if f.endswith('.mkv')]
+                if not mkvs:
+                    continue
+                
+                with st.expander(f"📁 {job_name}"):
+                    for mkv in mkvs:
+                        mkv_path = os.path.join(job_dir, mkv)
+                        col_name, col_btn = st.columns([3, 1])
+                        with col_name:
+                            st.write(f"🎞️ **{mkv}**")
+                            st.caption(f"{(os.path.getsize(mkv_path) / (1024*1024)):.1f} MB")
+                        with col_btn:
+                            with open(mkv_path, "rb") as f:
+                                st.download_button(
+                                    label="⬇ Download",
+                                    data=f,
+                                    file_name=mkv,
+                                    mime="video/x-matroska",
+                                    key=f"dl_{job_name}_{mkv}"
+                                )
+                    
+                    # Also look for SRT files
+                    srts = [f for f in os.listdir(job_dir) if f.endswith('.srt')]
+                    if srts:
+                        st.markdown("**Subtitles:**")
+                        for srt in srts:
+                            srt_path = os.path.join(job_dir, srt)
+                            with open(srt_path, "rb") as f:
+                                st.download_button(
+                                    label=f"⬇ {srt}",
+                                    data=f,
+                                    file_name=srt,
+                                    mime="text/plain",
+                                    key=f"dl_{job_name}_{srt}"
+                                )
+        else:
+            st.info("No past results found yet.")
+    else:
+        st.info("No output directory found.")
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Pipeline execution
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ── Run Pipeline Tab ────────────────────────────────────────────────────────
+with tab_run:
+    col_upload, col_info = st.columns([2, 1])
 
-def _save_uploaded_file(uploaded) -> str:
-    """Save the Streamlit UploadedFile to a temp directory and return path."""
-    tmp_dir = os.path.join(tempfile.gettempdir(), "nptel_pipeline")
-    os.makedirs(tmp_dir, exist_ok=True)
-    dest = os.path.join(tmp_dir, uploaded.name)
-    with open(dest, "wb") as f:
-        f.write(uploaded.getbuffer())
-    return dest
+    with col_upload:
+        uploaded_file = st.file_uploader(
+            "Upload a lecture video",
+            type=["mp4", "mkv", "avi", "webm", "mov"],
+            help="Supported formats: MP4, MKV, AVI, WebM, MOV",
+        )
+        
+        job_name_override = None
+        if uploaded_file is not None:
+            default_name = os.path.splitext(uploaded_file.name)[0]
+            job_name_override = st.text_input(
+                "Project / Job Name", 
+                value=default_name, 
+                help="This will be the name of the output folder and files."
+            )
+
+    with col_info:
+        st.markdown("##### How it works")
+        st.markdown(
+            """
+            1. **Upload** your NPTEL lecture video  
+            2. **Configure** options in the sidebar  
+            3. **Click Run** and wait for results  
+            4. **Download** subtitles & audio  
+            """
+        )
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Pipeline execution
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def _save_uploaded_file(uploaded, new_name=None) -> str:
+        """Save the Streamlit UploadedFile to a temp directory and return path."""
+        tmp_dir = os.path.join(tempfile.gettempdir(), "nptel_pipeline")
+        os.makedirs(tmp_dir, exist_ok=True)
+        
+        filename = uploaded.name
+        if new_name:
+            ext = os.path.splitext(uploaded.name)[1]
+            filename = f"{new_name}{ext}"
+            
+        dest = os.path.join(tmp_dir, filename)
+        with open(dest, "wb") as f:
+            f.write(uploaded.getbuffer())
+        return dest
 
 
-if uploaded_file is not None:
-    st.divider()
+    if uploaded_file is not None:
+        st.divider()
 
-    # Show video preview
-    st.video(uploaded_file)
+        # Show video preview
+        st.video(uploaded_file)
 
-    if st.button("🚀  Run Pipeline", type="primary", use_container_width=True):
+        if st.button("🚀  Run Pipeline", type="primary", use_container_width=True):
 
-        if not target_langs:
-            st.error("Please select at least one target language in the sidebar.")
-            st.stop()
+            if not target_langs:
+                st.error("Please select at least one target language in the sidebar.")
+                st.stop()
 
-        video_path = _save_uploaded_file(uploaded_file)
-        video_name = os.path.splitext(uploaded_file.name)[0]
+            from src.job_queue import submit_job, active_job_count
 
-        # Create a dedicated output folder for this run
-        run_output = os.path.join(OUTPUT_DIR, video_name)
-        os.makedirs(run_output, exist_ok=True)
+            # Reject if 2+ jobs are already active (1 running + 1 waiting = server busy)
+            if active_job_count() > 2:
+                st.error(
+                    "🔴 **Server busy** — too many jobs already queued. "
+                    "Please try again in a few minutes."
+                )
+                st.stop()
 
-        # Progress tracking
-        progress = st.progress(0, text="Starting pipeline…")
-        status = st.status("Pipeline running…", expanded=True)
+            # Sanitize job name
+            import re
+            final_job_name = job_name_override.strip() if job_name_override else os.path.splitext(uploaded_file.name)[0]
+            final_job_name = re.sub(r'[^a-zA-Z0-9_\-\s]', '', final_job_name).strip().replace(' ', '_')
+            if not final_job_name:
+                final_job_name = "nptel_job"
+                
+            video_path = _save_uploaded_file(uploaded_file, new_name=final_job_name)
+            video_name = final_job_name
+            run_output = os.path.join(OUTPUT_DIR, video_name)
+            os.makedirs(run_output, exist_ok=True)
 
-        # Map pipeline steps to Streamlit progress percentages
-        _STEP_PCT = {0: 2, 1: 15, 2: 35, 3: 55, 4: 62, 5: 78, 6: 90, 7: 98, 8: 99}
-
-        def _st_progress(step: int, total: int, message: str) -> None:
-            pct = _STEP_PCT.get(step, int(step / max(total, 1) * 100))
-            progress.progress(pct, text=message)
-            with status:
-                st.write(f"**Step {step}/{total}** – {message}")
-
-        try:
-            result = run_pipeline(
+            # Submit to the global GPU queue — returns immediately with a job_id
+            job_id = submit_job(
+                run_pipeline,
                 video_path=video_path,
                 output_dir=run_output,
                 stt_method=stt_method,
@@ -376,304 +484,302 @@ if uploaded_file is not None:
                 do_tts=do_tts,
                 tts_engine=tts_engine,
                 separate_music=separate_music,
-                voice_profile=None,  # Legacy 
+                voice_profile=None,
                 enable_prosody=enable_prosody,
                 enable_glossary=enable_glossary,
                 enable_enhancer=enable_enhancer,
                 enable_lip_sync=enable_lip_sync,
-                progress=_st_progress,
             )
-
-            subtitle_paths = result.get("subtitles", {})
-            aligned_audio = result.get("aligned_audio", {})
-            mkv_path = result.get("dubbed_video")
-            lip_synced_videos = result.get("lip_synced_videos", {})
-            lip_sync_used_wav2lip = result.get("lip_sync_used_wav2lip", False)
-            lip_sync_errors = result.get("lip_sync_errors", {})
-
-            progress.progress(100, text="Pipeline complete! ✅")
-
-            with status:
-                st.write("✅ **All done!**")
-            status.update(label="Pipeline complete!", state="complete")
-
-            # Store results in session state for persistent access
-            lip_synced_mkvs = result.get("lip_synced_mkvs", {})
-            st.session_state["pipeline_result"] = {
-                "subtitle_paths": subtitle_paths,
-                "aligned_audio": aligned_audio,
-                "mkv_path": mkv_path,
-                "lip_synced_videos": lip_synced_videos,
-                "lip_sync_used_wav2lip": lip_sync_used_wav2lip,
-                "lip_sync_errors": lip_sync_errors,
-                "lip_synced_mkvs": lip_synced_mkvs,
-                "video_path": video_path,
-                "video_name": video_name,
-                "run_output": run_output,
+            st.session_state["active_job_id"]   = job_id
+            st.session_state["active_job_meta"] = {
+                "video_path":   video_path,
+                "video_name":   video_name,
+                "run_output":   run_output,
                 "target_langs": target_langs,
             }
+            st.rerun()
 
-        except NotImplementedError as e:
-            progress.progress(0, text="Error")
-            status.update(label="Pipeline failed", state="error")
-            st.error(
-                f"**Not yet implemented:** {e}\n\n"
-                "This module still has a placeholder. "
-                "Wire up the API calls first, then try again."
+    # ── Job status polling UI ──────────────────────────────────────────────────────
+    if "active_job_id" in st.session_state and "pipeline_result" not in st.session_state:
+        from src.job_queue import get_job_status, DONE, FAILED, PENDING, RUNNING
+
+        job_id   = st.session_state["active_job_id"]
+        job_meta = st.session_state.get("active_job_meta", {})
+        snap     = get_job_status(job_id)
+
+        st.divider()
+
+        if snap["status"] == PENDING:
+            pos = snap["queue_position"]
+            st.info(
+                f"⏳ **Your job is queued.** "
+                f"{'You are next!' if pos == 0 else f'{pos} job(s) ahead of you.'} "
+                "The pipeline will start automatically when the GPU is free."
             )
-        except ValueError as e:
-            progress.progress(0, text="Error")
-            status.update(label="Pipeline failed", state="error")
-            _emsg = str(e).lower()
-            if "no speech" in _emsg or "empty transcript" in _emsg:
-                st.error("🎵 **No speech detected in the audio**")
-                from src.audio_separator import is_demucs_available as _ida
-                if _ida():
-                    st.info(
-                        "Demucs is installed. The pipeline will **automatically** "
-                        "try vocal separation the next time you run. "
-                        "If it already tried and still failed, the audio may "
-                        "contain no spoken words at all."
-                    )
-                else:
-                    st.warning(
-                        "Install **Demucs** to enable automatic music/vocal separation."
-                        " After installing, re-run and the pipeline will auto-detect"  
-                        " and separate vocals from background music automatically.\n\n"
-                        "```\npip install demucs\n```"
-                    )
-            else:
-                st.error(f"**Error:** {e}")
-                st.exception(e)
+            st.progress(0, text="Waiting in queue…")
+            time.sleep(2)
+            st.rerun()
 
-        except Exception as e:
-            progress.progress(0, text="Error")
-            status.update(label="Pipeline failed", state="error")
-            st.error(f"**Error:** {e}")
-            st.exception(e)
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Results display – persistent via session state
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-if "pipeline_result" in st.session_state:
-    res = st.session_state["pipeline_result"]
-    subtitle_paths = res["subtitle_paths"]
-    aligned_audio = res["aligned_audio"]
-    mkv_path = res["mkv_path"]
-    lip_synced_videos = res.get("lip_synced_videos", {})
-    lip_sync_used_wav2lip = res.get("lip_sync_used_wav2lip", False)
-    lip_sync_errors = res.get("lip_sync_errors", {})
-    lip_synced_mkvs = res.get("lip_synced_mkvs", {})
-    video_path = res["video_path"]
-    video_name = res["video_name"]
-    run_output = res["run_output"]
-    target_langs_done = res["target_langs"]
-
-    st.divider()
-    st.subheader("📦 Results")
-
-    # ── Video preview with dubbed audio + subtitle overlay ──────
-    st.markdown("##### 🎬 Video Preview")
-    st.markdown(
-        "Preview the dubbed video with burned-in subtitles. "
-        "Choose the audio language and subtitle language below."
-    )
-
-    # Build language options for dropdowns
-    audio_options = {}
-    if aligned_audio:
-        for lc in sorted(aligned_audio.keys()):
-            lang_name = TARGET_LANGUAGES.get(lc, {}).get("name", lc)
-            audio_options[f"{lang_name} ({lc})"] = lc
-
-    subtitle_options = {"None (no subtitles)": None}
-    for lc in sorted(subtitle_paths.keys()):
-        lang_name = ALL_LANGUAGES.get(lc, {}).get("name", lc)
-        subtitle_options[f"{lang_name} ({lc})"] = lc
-
-    col_audio_sel, col_sub_sel = st.columns(2)
-
-    with col_audio_sel:
-        if audio_options:
-            selected_audio_label = st.selectbox(
-                "🔊 Audio language",
-                options=list(audio_options.keys()),
-                index=0,
-                help="Select which dubbed audio track to preview",
+        elif snap["status"] == RUNNING:
+            elapsed = int(snap["elapsed_s"])
+            st.success("🔄 **Your job is running on the GPU.**")
+            st.progress(
+                snap["progress_pct"],
+                text=f"{snap['progress_msg']}  •  elapsed {elapsed}s"
             )
-            selected_audio_lang = audio_options[selected_audio_label]
-        else:
-            st.info("No dubbed audio tracks available")
-            selected_audio_lang = None
+            time.sleep(2)
+            st.rerun()
 
-    with col_sub_sel:
-        selected_sub_label = st.selectbox(
-            "📝 Subtitle language",
-            options=list(subtitle_options.keys()),
-            index=0,
-            help="Select which subtitle language to burn into the preview",
-        )
-        selected_sub_lang = subtitle_options[selected_sub_label]
+        elif snap["status"] == DONE:
+            result       = snap["result"] or {}
+            video_name   = job_meta.get("video_name", "output")
+            run_output   = job_meta.get("run_output", "")
+            target_langs = job_meta.get("target_langs", [])
 
-    # Generate / display preview
-    if selected_audio_lang and selected_audio_lang in aligned_audio:
-        # Build a unique preview filename based on audio + subtitle selection
-        sub_tag = selected_sub_lang or "nosub"
-        preview_name = f"{video_name}_preview_{selected_audio_lang}_{sub_tag}.mp4"
-        preview_path = os.path.join(run_output, preview_name)
+            st.session_state["pipeline_result"] = {
+                "subtitle_paths":        result.get("subtitles", {}),
+                "aligned_audio":         result.get("aligned_audio", {}),
+                "mkv_path":              result.get("dubbed_video"),
+                "lip_synced_videos":     result.get("lip_synced_videos", {}),
+                "lip_sync_used_wav2lip": result.get("lip_sync_used_wav2lip", False),
+                "lip_sync_errors":       result.get("lip_sync_errors", {}),
+                "lip_synced_mkvs":       result.get("lip_synced_mkvs", {}),
+                "video_path":            job_meta.get("video_path", ""),
+                "video_name":            video_name,
+                "run_output":            run_output,
+                "target_langs":          target_langs,
+            }
+            del st.session_state["active_job_id"]
+            st.rerun()
 
-        if not os.path.isfile(preview_path):
-            with st.spinner("Creating preview video…"):
-                try:
-                    sub_file = None
-                    if selected_sub_lang and selected_sub_lang in subtitle_paths:
-                        sub_file = subtitle_paths[selected_sub_lang]
-                    create_preview_mp4(
-                        original_video=video_path,
-                        dubbed_audio=aligned_audio[selected_audio_lang],
-                        output_path=preview_path,
-                        subtitle_path=sub_file,
-                        subtitle_lang_code=selected_sub_lang,
-                    )
-                except Exception as exc:
-                    st.warning(f"Preview generation failed: {exc}")
-                    preview_path = None
+        elif snap["status"] == FAILED:
+            st.error(f"❌ **Pipeline failed:** {snap['error']}")
+            if st.button("Clear and try again"):
+                del st.session_state["active_job_id"]
+                st.rerun()
 
-        if preview_path and os.path.isfile(preview_path):
-            st.video(preview_path)
-        else:
-            st.info("Preview not available. Download the MKV and open in VLC.")
-    elif not aligned_audio:
-        # No dubbed audio — show original video
-        st.video(video_path)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Results display – persistent via session state
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    # ── Subtitle display ────────────────────────────────────────
-    if selected_sub_lang and selected_sub_lang in subtitle_paths:
-        sub_path = subtitle_paths[selected_sub_lang]
-        if os.path.isfile(sub_path):
-            with st.expander("📄 View subtitle text", expanded=False):
-                with open(sub_path, "r", encoding="utf-8-sig") as f:
-                    st.code(f.read(), language=None)
+    if "pipeline_result" in st.session_state:
+        res = st.session_state["pipeline_result"]
+        subtitle_paths = res["subtitle_paths"]
+        aligned_audio = res["aligned_audio"]
+        mkv_path = res["mkv_path"]
+        lip_synced_videos = res.get("lip_synced_videos", {})
+        lip_sync_used_wav2lip = res.get("lip_sync_used_wav2lip", False)
+        lip_sync_errors = res.get("lip_sync_errors", {})
+        lip_synced_mkvs = res.get("lip_synced_mkvs", {})
+        video_path = res["video_path"]
+        video_name = res["video_name"]
+        run_output = res["run_output"]
+        target_langs_done = res["target_langs"]
 
-    # ── Final dubbed video download ──
-    st.markdown("##### 📥 Downloads")
+        st.divider()
+        st.subheader("📦 Results")
 
-    # Per-language lip-synced MKVs (preferred when lip sync ran)
-    if lip_synced_mkvs:
-        st.caption(
-            "👄 **Lip-synced MKV** — video frames animated with Wav2Lip + "
-            "enhanced dubbed audio (open in VLC / mpv and select audio/subtitle tracks)"
-        )
-        ls_dl_cols = st.columns(len(lip_synced_mkvs))
-        for i, (lang_code, ls_mkv) in enumerate(sorted(lip_synced_mkvs.items())):
-            lang_name = ALL_LANGUAGES.get(lang_code, {}).get("name", lang_code)
-            with ls_dl_cols[i]:
-                if os.path.isfile(ls_mkv):
-                    with open(ls_mkv, "rb") as f:
-                        ls_bytes = f.read()
-                    size_mb = len(ls_bytes) / (1024 * 1024)
-                    st.download_button(
-                        f"⬇ {lang_name} lip-sync MKV ({size_mb:.1f} MB)",
-                        data=ls_bytes,
-                        file_name=os.path.basename(ls_mkv),
-                        mime="video/x-matroska",
-                        type="primary",
-                        use_container_width=True,
-                    )
-                else:
-                    st.info(f"{lang_name} lip-sync MKV not found")
-
-    # Original multi-language MKV (all audio tracks, no lip-sync video)
-    if mkv_path and os.path.isfile(mkv_path):
-        label = "⬇ Download multi-language MKV (original video)" if lip_synced_mkvs else "⬇ Download dubbed video"
-        with open(mkv_path, "rb") as f:
-            mkv_bytes = f.read()
-        size_mb = len(mkv_bytes) / (1024 * 1024)
-        st.download_button(
-            f"{label} ({size_mb:.1f} MB)",
-            data=mkv_bytes,
-            file_name=os.path.basename(mkv_path),
-            mime="video/x-matroska",
-            type="secondary" if lip_synced_mkvs else "primary",
-            use_container_width=True,
+        # ── Video preview with dubbed audio + subtitle overlay ──────
+        st.markdown("##### 🎬 Video Preview")
+        st.markdown(
+            "Preview the dubbed video with burned-in subtitles. "
+            "Choose the audio language and subtitle language below."
         )
 
-    # ── Subtitle downloads ──
-    st.markdown("##### 📝 Subtitles")
-    sub_cols = st.columns(len(subtitle_paths))
-    for i, (lang, path) in enumerate(subtitle_paths.items()):
-        lang_name = ALL_LANGUAGES.get(lang, {}).get("name", lang)
-        with sub_cols[i]:
-            if os.path.isfile(path):
-                with open(path, "r", encoding="utf-8-sig") as f:
-                    srt_data = f.read()
-                st.download_button(
-                    f"⬇ {lang_name} (.srt)",
-                    data=srt_data,
-                    file_name=os.path.basename(path),
-                    mime="text/plain",
+        # Build language options for dropdowns
+        audio_options = {}
+        if aligned_audio:
+            for lc in sorted(aligned_audio.keys()):
+                lang_name = TARGET_LANGUAGES.get(lc, {}).get("name", lc)
+                audio_options[f"{lang_name} ({lc})"] = lc
+
+        subtitle_options = {"None (no subtitles)": None}
+        for lc in sorted(subtitle_paths.keys()):
+            lang_name = ALL_LANGUAGES.get(lc, {}).get("name", lc)
+            subtitle_options[f"{lang_name} ({lc})"] = lc
+
+        col_audio_sel, col_sub_sel = st.columns(2)
+
+        with col_audio_sel:
+            if audio_options:
+                selected_audio_label = st.selectbox(
+                    "🔊 Audio language",
+                    options=list(audio_options.keys()),
+                    index=0,
+                    help="Select which dubbed audio track to preview",
                 )
+                selected_audio_lang = audio_options[selected_audio_label]
             else:
-                st.info(f"{lang_name} subtitle not found")
+                st.info("No dubbed audio tracks available")
+                selected_audio_lang = None
 
-    # ── Aligned audio downloads ──
-    if aligned_audio:
-        st.markdown("##### 🔊 Aligned Dubbed Audio")
-        tts_cols = st.columns(len(aligned_audio))
-        for i, (lang, path) in enumerate(aligned_audio.items()):
-            lang_name = TARGET_LANGUAGES.get(lang, {}).get("name", lang)
-            with tts_cols[i]:
-                if os.path.isfile(path):
-                    with open(path, "rb") as f:
-                        audio_bytes = f.read()
-                    st.audio(audio_bytes, format="audio/mpeg")
-                    st.download_button(
-                        f"⬇ {lang_name} audio",
-                        data=audio_bytes,
-                        file_name=os.path.basename(path),
-                        mime="audio/mpeg",
-                    )
-                else:
-                    st.info(f"{lang_name} audio not found")
-
-    # ── Lip-synced video downloads ──────────────────────────────
-    if lip_synced_videos:
-        st.markdown("##### 👄 Lip-Synced Videos")
-        if lip_sync_used_wav2lip:
-            st.caption("✅ Sync mode: Wav2Lip (facial animation)")
-        else:
-            st.warning(
-                "⚠️ Lip sync fell back to **audio-swap only** (no facial animation). "
-                "Check the Streamlit console / terminal for the full error. "
-                "Common causes:\n"
-                "- No face detected in the video (Wav2Lip needs a visible face)\n"
-                "- Wav2Lip process failed during inference\n"
-                "See error details below."
+        with col_sub_sel:
+            selected_sub_label = st.selectbox(
+                "📝 Subtitle language",
+                options=list(subtitle_options.keys()),
+                index=0,
+                help="Select which subtitle language to burn into the preview",
             )
-            if lip_sync_errors:
-                with st.expander("🔍 Wav2Lip error details", expanded=True):
-                    for lang, err in lip_sync_errors.items():
-                        lang_name = TARGET_LANGUAGES.get(lang, {}).get("name", lang)
-                        st.error(f"**{lang_name}**: {err[:1000]}")
-        ls_cols = st.columns(len(lip_synced_videos))
-        for i, (lang, path) in enumerate(lip_synced_videos.items()):
-            lang_name = TARGET_LANGUAGES.get(lang, {}).get("name", lang)
-            with ls_cols[i]:
+            selected_sub_lang = subtitle_options[selected_sub_label]
+
+        # Generate / display preview
+        if selected_audio_lang and selected_audio_lang in aligned_audio:
+            # Build a unique preview filename based on audio + subtitle selection
+            sub_tag = selected_sub_lang or "nosub"
+            preview_name = f"{video_name}_preview_{selected_audio_lang}_{sub_tag}.mp4"
+            preview_path = os.path.join(run_output, preview_name)
+
+            if not os.path.isfile(preview_path):
+                with st.spinner("Creating preview video…"):
+                    try:
+                        sub_file = None
+                        if selected_sub_lang and selected_sub_lang in subtitle_paths:
+                            sub_file = subtitle_paths[selected_sub_lang]
+                        create_preview_mp4(
+                            original_video=video_path,
+                            dubbed_audio=aligned_audio[selected_audio_lang],
+                            output_path=preview_path,
+                            subtitle_path=sub_file,
+                            subtitle_lang_code=selected_sub_lang,
+                        )
+                    except Exception as exc:
+                        st.warning(f"Preview generation failed: {exc}")
+                        preview_path = None
+
+            if preview_path and os.path.isfile(preview_path):
+                st.video(preview_path)
+            else:
+                st.info("Preview not available. Download the MKV and open in VLC.")
+        elif not aligned_audio:
+            # No dubbed audio — show original video
+            st.video(video_path)
+
+        # ── Subtitle display ────────────────────────────────────────
+        if selected_sub_lang and selected_sub_lang in subtitle_paths:
+            sub_path = subtitle_paths[selected_sub_lang]
+            if os.path.isfile(sub_path):
+                with st.expander("📄 View subtitle text", expanded=False):
+                    with open(sub_path, "r", encoding="utf-8-sig") as f:
+                        st.code(f.read(), language=None)
+
+        # ── Final dubbed video download ──
+        st.markdown("##### 📥 Downloads")
+
+        # Per-language lip-synced MKVs (preferred when lip sync ran)
+        if lip_synced_mkvs:
+            st.caption(
+                "👄 **Lip-synced MKV** — video frames animated with Wav2Lip + "
+                "enhanced dubbed audio (open in VLC / mpv and select audio/subtitle tracks)"
+            )
+            ls_dl_cols = st.columns(len(lip_synced_mkvs))
+            for i, (lang_code, ls_mkv) in enumerate(sorted(lip_synced_mkvs.items())):
+                lang_name = ALL_LANGUAGES.get(lang_code, {}).get("name", lang_code)
+                with ls_dl_cols[i]:
+                    if os.path.isfile(ls_mkv):
+                        with open(ls_mkv, "rb") as f:
+                            ls_bytes = f.read()
+                        size_mb = len(ls_bytes) / (1024 * 1024)
+                        st.download_button(
+                            f"⬇ {lang_name} lip-sync MKV ({size_mb:.1f} MB)",
+                            data=ls_bytes,
+                            file_name=os.path.basename(ls_mkv),
+                            mime="video/x-matroska",
+                            type="primary",
+                            use_container_width=True,
+                        )
+                    else:
+                        st.info(f"{lang_name} lip-sync MKV not found")
+
+        # Original multi-language MKV (all audio tracks, no lip-sync video)
+        if mkv_path and os.path.isfile(mkv_path):
+            label = "⬇ Download multi-language MKV (original video)" if lip_synced_mkvs else "⬇ Download dubbed video"
+            with open(mkv_path, "rb") as f:
+                mkv_bytes = f.read()
+            size_mb = len(mkv_bytes) / (1024 * 1024)
+            st.download_button(
+                f"{label} ({size_mb:.1f} MB)",
+                data=mkv_bytes,
+                file_name=os.path.basename(mkv_path),
+                mime="video/x-matroska",
+                type="secondary" if lip_synced_mkvs else "primary",
+                use_container_width=True,
+            )
+
+        # ── Subtitle downloads ──
+        st.markdown("##### 📝 Subtitles")
+        sub_cols = st.columns(len(subtitle_paths))
+        for i, (lang, path) in enumerate(subtitle_paths.items()):
+            lang_name = ALL_LANGUAGES.get(lang, {}).get("name", lang)
+            with sub_cols[i]:
                 if os.path.isfile(path):
-                    st.video(path)
-                    with open(path, "rb") as f:
-                        vid_bytes = f.read()
-                    size_mb = len(vid_bytes) / (1024 * 1024)
+                    with open(path, "r", encoding="utf-8-sig") as f:
+                        srt_data = f.read()
                     st.download_button(
-                        f"⬇ {lang_name} lip-sync ({size_mb:.1f} MB)",
-                        data=vid_bytes,
+                        f"⬇ {lang_name} (.srt)",
+                        data=srt_data,
                         file_name=os.path.basename(path),
-                        mime="video/mp4",
+                        mime="text/plain",
                     )
                 else:
-                    st.info(f"{lang_name} lip-sync video not found")
+                    st.info(f"{lang_name} subtitle not found")
 
-elif uploaded_file is None:
-    # Empty state
-    st.info("👆 Upload a lecture video to get started.", icon="📹")
+        # ── Aligned audio downloads ──
+        if aligned_audio:
+            st.markdown("##### 🔊 Aligned Dubbed Audio")
+            tts_cols = st.columns(len(aligned_audio))
+            for i, (lang, path) in enumerate(aligned_audio.items()):
+                lang_name = TARGET_LANGUAGES.get(lang, {}).get("name", lang)
+                with tts_cols[i]:
+                    if os.path.isfile(path):
+                        with open(path, "rb") as f:
+                            audio_bytes = f.read()
+                        st.audio(audio_bytes, format="audio/mpeg")
+                        st.download_button(
+                            f"⬇ {lang_name} audio",
+                            data=audio_bytes,
+                            file_name=os.path.basename(path),
+                            mime="audio/mpeg",
+                        )
+                    else:
+                        st.info(f"{lang_name} audio not found")
+
+        # ── Lip-synced video downloads ──────────────────────────────
+        if lip_synced_videos:
+            st.markdown("##### 👄 Lip-Synced Videos")
+            if lip_sync_used_wav2lip:
+                st.caption("✅ Sync mode: Wav2Lip (facial animation)")
+            else:
+                st.warning(
+                    "⚠️ Lip sync fell back to **audio-swap only** (no facial animation). "
+                    "Check the Streamlit console / terminal for the full error. "
+                    "Common causes:\n"
+                    "- No face detected in the video (Wav2Lip needs a visible face)\n"
+                    "- Wav2Lip process failed during inference\n"
+                    "See error details below."
+                )
+                if lip_sync_errors:
+                    with st.expander("🔍 Wav2Lip error details", expanded=True):
+                        for lang, err in lip_sync_errors.items():
+                            lang_name = TARGET_LANGUAGES.get(lang, {}).get("name", lang)
+                            st.error(f"**{lang_name}**: {err[:1000]}")
+            ls_cols = st.columns(len(lip_synced_videos))
+            for i, (lang, path) in enumerate(lip_synced_videos.items()):
+                lang_name = TARGET_LANGUAGES.get(lang, {}).get("name", lang)
+                with ls_cols[i]:
+                    if os.path.isfile(path):
+                        st.video(path)
+                        with open(path, "rb") as f:
+                            vid_bytes = f.read()
+                        size_mb = len(vid_bytes) / (1024 * 1024)
+                        st.download_button(
+                            f"⬇ {lang_name} lip-sync ({size_mb:.1f} MB)",
+                            data=vid_bytes,
+                            file_name=os.path.basename(path),
+                            mime="video/mp4",
+                        )
+                    else:
+                        st.info(f"{lang_name} lip-sync video not found")
+
+    elif uploaded_file is None:
+        # Empty state
+        st.info("👆 Upload a lecture video to get started.", icon="📹")
