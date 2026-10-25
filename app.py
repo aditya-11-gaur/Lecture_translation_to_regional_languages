@@ -4,9 +4,11 @@ NPTEL Lecture Translation Pipeline – Streamlit GUI
 Launch with:  streamlit run app.py
 """
 
+import json
 import os
+import re
+import secrets
 import sys
-import time
 import shutil
 import tempfile
 import logging
@@ -28,6 +30,8 @@ from config.settings import (
     get_available_engines,
     get_default_engine,
     DEFAULT_TARGET_LANGS,
+    MAX_CONCURRENT_JOBS,
+    MAX_WAITING_JOBS,
 )
 from src.tts_generator import (
     is_tts_available,
@@ -83,6 +87,37 @@ def check_password():
 
 if not check_password():
     st.stop()
+
+# ── Per-browser owner key ──────────────────────────────────────
+# Jobs are tagged with this key so "Past Results" lists only your own.  It
+# lives in the page URL, so bookmarking the page keeps your results reachable.
+_owner = st.query_params.get("u")
+if not _owner:
+    _owner = secrets.token_urlsafe(12)
+    st.query_params["u"] = _owner
+
+JOB_META_FILE = ".job.json"
+
+
+def _job_owner(job_dir: str) -> str | None:
+    """Owner key of a job folder, or None for folders made before keys (shared)."""
+    try:
+        with open(os.path.join(job_dir, JOB_META_FILE), encoding="utf-8") as f:
+            return json.load(f)["owner"]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _read_on_click(path: str):
+    """Download-button data that is read only when the button is clicked."""
+    def read() -> bytes:
+        with open(path, "rb") as f:
+            return f.read()
+    return read
+
+
+def _size_mb(path: str) -> float:
+    return os.path.getsize(path) / (1024 * 1024)
 
 # ── Custom CSS ─────────────────────────────────────────────────
 st.markdown(
@@ -161,12 +196,6 @@ with st.sidebar:
 
     # ── Advanced Settings ─────────────────────────────
     with st.expander("🛠️ Advanced Audio Settings", expanded=False):
-        enable_glossary = st.checkbox(
-            "Enable Domain-Specific Glossary",
-            value=True,
-            help="Bypass translation for technical terms to keep them in English (Code-Mixing).",
-        )
-        
         enable_prosody = st.checkbox(
             "Enable Praat Prosody Transfer",
             value=False,
@@ -217,7 +246,7 @@ with st.sidebar:
     _tts_engine_has_vc = tts_engine is not None and tts_engine.endswith("_vc")
     with st.expander("🎙️ Voice Cloning (Stage 2)", expanded=False):
         st.markdown(
-            "**Stage 1** — Language-correct dubbed speech (Sarvam / edge-tts)  \n"
+            "**Stage 1** — Language-correct dubbed speech (Sarvam / Google Neural2)  \n"
             "**Stage 2** — Tone-color transfer: makes the dubbed voice **sound like** the original lecturer.  \n"
         )
         st.divider()
@@ -361,55 +390,68 @@ with st.sidebar:
 tab_run, tab_history = st.tabs(["🚀 Run Pipeline", "📂 Past Results"])
 
 # ── Past Results Tab ────────────────────────────────────────────────────────
+def _show_past_job(job_name: str, job_dir: str, mkvs: list[str]) -> None:
+    with st.expander(f"📁 {job_name}"):
+        for mkv in mkvs:
+            mkv_path = os.path.join(job_dir, mkv)
+            col_name, col_btn = st.columns([3, 1])
+            with col_name:
+                st.write(f"🎞️ **{mkv}**")
+                st.caption(f"{_size_mb(mkv_path):.1f} MB")
+            with col_btn:
+                st.download_button(
+                    label="⬇ Download",
+                    data=_read_on_click(mkv_path),
+                    file_name=mkv,
+                    mime="video/x-matroska",
+                    key=f"dl_{job_name}_{mkv}",
+                )
+
+        srts = sorted(f for f in os.listdir(job_dir) if f.endswith(".srt"))
+        if srts:
+            st.markdown("**Subtitles:**")
+            for srt in srts:
+                st.download_button(
+                    label=f"⬇ {srt}",
+                    data=_read_on_click(os.path.join(job_dir, srt)),
+                    file_name=srt,
+                    mime="text/plain",
+                    key=f"dl_{job_name}_{srt}",
+                )
+
+
 with tab_history:
     st.markdown("### 📂 Previously Processed Videos")
-    st.write("Browse and download videos you have already processed without using GPU/API resources.")
-    
-    if os.path.exists(OUTPUT_DIR):
-        jobs = [d for d in os.listdir(OUTPUT_DIR) if os.path.isdir(os.path.join(OUTPUT_DIR, d))]
-        if jobs:
-            for job_name in sorted(jobs, reverse=True):
-                job_dir = os.path.join(OUTPUT_DIR, job_name)
-                # Check for MKVs
-                mkvs = [f for f in os.listdir(job_dir) if f.endswith('.mkv')]
-                if not mkvs:
-                    continue
-                
-                with st.expander(f"📁 {job_name}"):
-                    for mkv in mkvs:
-                        mkv_path = os.path.join(job_dir, mkv)
-                        col_name, col_btn = st.columns([3, 1])
-                        with col_name:
-                            st.write(f"🎞️ **{mkv}**")
-                            st.caption(f"{(os.path.getsize(mkv_path) / (1024*1024)):.1f} MB")
-                        with col_btn:
-                            with open(mkv_path, "rb") as f:
-                                st.download_button(
-                                    label="⬇ Download",
-                                    data=f,
-                                    file_name=mkv,
-                                    mime="video/x-matroska",
-                                    key=f"dl_{job_name}_{mkv}"
-                                )
-                    
-                    # Also look for SRT files
-                    srts = [f for f in os.listdir(job_dir) if f.endswith('.srt')]
-                    if srts:
-                        st.markdown("**Subtitles:**")
-                        for srt in srts:
-                            srt_path = os.path.join(job_dir, srt)
-                            with open(srt_path, "rb") as f:
-                                st.download_button(
-                                    label=f"⬇ {srt}",
-                                    data=f,
-                                    file_name=srt,
-                                    mime="text/plain",
-                                    key=f"dl_{job_name}_{srt}"
-                                )
-        else:
-            st.info("No past results found yet.")
-    else:
-        st.info("No output directory found.")
+    st.write(
+        "Your earlier jobs from this browser, plus shared examples. "
+        "Bookmark this page to find your results again later."
+    )
+
+    mine, shared = [], []
+    if os.path.isdir(OUTPUT_DIR):
+        for job_name in sorted(os.listdir(OUTPUT_DIR), reverse=True):
+            job_dir = os.path.join(OUTPUT_DIR, job_name)
+            if not os.path.isdir(job_dir):
+                continue
+            mkvs = sorted(f for f in os.listdir(job_dir) if f.endswith(".mkv"))
+            if not mkvs:
+                continue
+            owner = _job_owner(job_dir)
+            if owner == _owner:
+                mine.append((job_name, job_dir, mkvs))
+            elif owner is None:
+                shared.append((job_name, job_dir, mkvs))
+
+    if mine:
+        st.markdown("#### Your jobs")
+        for job in mine:
+            _show_past_job(*job)
+    if shared:
+        st.markdown("#### Shared examples")
+        for job in shared:
+            _show_past_job(*job)
+    if not mine and not shared:
+        st.info("No past results found yet.")
 
 # ── Run Pipeline Tab ────────────────────────────────────────────────────────
 with tab_run:
@@ -447,10 +489,15 @@ with tab_run:
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def _save_uploaded_file(uploaded, new_name=None) -> str:
-        """Save the Streamlit UploadedFile to a temp directory and return path."""
-        tmp_dir = os.path.join(tempfile.gettempdir(), "nptel_pipeline")
-        os.makedirs(tmp_dir, exist_ok=True)
-        
+        """
+        Save the Streamlit UploadedFile and return its path.  Every upload gets
+        its own temp folder, so two uploads with the same name never overwrite
+        each other while one is still waiting to be processed.
+        """
+        base_dir = os.path.join(tempfile.gettempdir(), "nptel_pipeline")
+        os.makedirs(base_dir, exist_ok=True)
+        tmp_dir = tempfile.mkdtemp(dir=base_dir)
+
         filename = uploaded.name
         if new_name:
             ext = os.path.splitext(uploaded.name)[1]
@@ -474,50 +521,70 @@ with tab_run:
                 st.error("Please select at least one target language in the sidebar.")
                 st.stop()
 
-            from src.job_queue import submit_job, active_job_count
+            from src.job_queue import JobNameInUse, active_job_count, submit_job
 
-            # Reject if 2+ jobs are already active (1 running + 1 waiting = server busy)
-            if active_job_count() > 2:
+            # MAX_CONCURRENT_JOBS run side by side; MAX_WAITING_JOBS more may queue
+            if active_job_count() >= MAX_CONCURRENT_JOBS + MAX_WAITING_JOBS:
                 st.error(
-                    "🔴 **Server busy** — too many jobs already queued. "
-                    "Please try again in a few minutes."
+                    f"🔴 **Server busy** — {MAX_CONCURRENT_JOBS} jobs are running and "
+                    "the queue is full. Please try again in a few minutes."
                 )
                 st.stop()
 
             # Sanitize job name
-            import re
             final_job_name = job_name_override.strip() if job_name_override else os.path.splitext(uploaded_file.name)[0]
             final_job_name = re.sub(r'[^a-zA-Z0-9_\-\s]', '', final_job_name).strip().replace(' ', '_')
             if not final_job_name:
                 final_job_name = "nptel_job"
                 
-            video_path = _save_uploaded_file(uploaded_file, new_name=final_job_name)
             video_name = final_job_name
             run_output = os.path.join(OUTPUT_DIR, video_name)
+
+            # The output folder is named after the job: don't let a job
+            # overwrite someone else's results (or the shared examples)
+            if os.path.isdir(run_output) and _job_owner(run_output) != _owner:
+                st.error(
+                    f"The job name **{video_name}** is already used by another job. "
+                    "Please choose a different name."
+                )
+                st.stop()
+
+            video_path = _save_uploaded_file(uploaded_file, new_name=final_job_name)
+
+            # Submit to the job queue — returns immediately with a job_id
+            try:
+                job_id = submit_job(
+                    run_pipeline,
+                    name=video_name,
+                    video_path=video_path,
+                    output_dir=run_output,
+                    stt_method=stt_method,
+                    translate_method=translate_method,
+                    target_langs=target_langs,
+                    do_tts=do_tts,
+                    tts_engine=tts_engine,
+                    separate_music=separate_music,
+                    enable_voice_cloning=enable_voice_cloning,
+                    enable_prosody=enable_prosody,
+                    enable_enhancer=enable_enhancer,
+                    enable_lip_sync=enable_lip_sync,
+                )
+            except JobNameInUse:
+                shutil.rmtree(os.path.dirname(video_path), ignore_errors=True)
+                st.error(
+                    f"A job named **{video_name}** is already queued or running. "
+                    "Wait for it to finish or choose a different name."
+                )
+                st.stop()
+
             os.makedirs(run_output, exist_ok=True)
+            with open(os.path.join(run_output, JOB_META_FILE), "w", encoding="utf-8") as f:
+                json.dump({"owner": _owner}, f)
             # Previews from an earlier run of this job would show the old audio
             for f in os.listdir(run_output):
                 if f.startswith(f"{video_name}_preview_") and f.endswith(".mp4"):
                     os.remove(os.path.join(run_output, f))
 
-            # Submit to the global GPU queue — returns immediately with a job_id
-            job_id = submit_job(
-                run_pipeline,
-                video_path=video_path,
-                output_dir=run_output,
-                stt_method=stt_method,
-                translate_method=translate_method,
-                target_langs=target_langs,
-                do_tts=do_tts,
-                tts_engine=tts_engine,
-                separate_music=separate_music,
-                voice_profile=None,
-                enable_voice_cloning=enable_voice_cloning,
-                enable_prosody=enable_prosody,
-                enable_glossary=enable_glossary,
-                enable_enhancer=enable_enhancer,
-                enable_lip_sync=enable_lip_sync,
-            )
             st.session_state["active_job_id"]   = job_id
             st.session_state["active_job_meta"] = {
                 "video_path":   video_path,
@@ -528,8 +595,33 @@ with tab_run:
             st.rerun()
 
     # ── Job status polling UI ──────────────────────────────────────────────────────
+    # Only this fragment re-runs every 2 s while a job is active, not the whole
+    # page (which would re-read every result file on each refresh).
+    @st.fragment(run_every=2)
+    def _job_status_panel(job_id: str) -> None:
+        from src.job_queue import get_job_status, PENDING, RUNNING
+
+        snap = get_job_status(job_id)
+        if snap["status"] == PENDING:
+            pos = snap["queue_position"]
+            st.info(
+                f"⏳ **Your job is queued.** "
+                f"{'You are next!' if pos == 0 else f'{pos} job(s) ahead of you.'} "
+                "It starts as soon as a job slot is free."
+            )
+            st.progress(0, text="Waiting in queue…")
+        elif snap["status"] == RUNNING:
+            elapsed = int(snap["elapsed_s"])
+            st.success("🔄 **Your job is running.**")
+            st.progress(
+                snap["progress_pct"],
+                text=f"{snap['progress_msg']}  •  elapsed {elapsed}s"
+            )
+        else:
+            st.rerun()   # finished: redraw the page with the results
+
     if "active_job_id" in st.session_state and "pipeline_result" not in st.session_state:
-        from src.job_queue import get_job_status, DONE, FAILED, PENDING, RUNNING
+        from src.job_queue import get_job_status, DONE, FAILED
 
         job_id   = st.session_state["active_job_id"]
         job_meta = st.session_state.get("active_job_meta", {})
@@ -537,28 +629,7 @@ with tab_run:
 
         st.divider()
 
-        if snap["status"] == PENDING:
-            pos = snap["queue_position"]
-            st.info(
-                f"⏳ **Your job is queued.** "
-                f"{'You are next!' if pos == 0 else f'{pos} job(s) ahead of you.'} "
-                "The pipeline will start automatically when the GPU is free."
-            )
-            st.progress(0, text="Waiting in queue…")
-            time.sleep(2)
-            st.rerun()
-
-        elif snap["status"] == RUNNING:
-            elapsed = int(snap["elapsed_s"])
-            st.success("🔄 **Your job is running on the GPU.**")
-            st.progress(
-                snap["progress_pct"],
-                text=f"{snap['progress_msg']}  •  elapsed {elapsed}s"
-            )
-            time.sleep(2)
-            st.rerun()
-
-        elif snap["status"] == DONE:
+        if snap["status"] == DONE:
             result       = snap["result"] or {}
             video_name   = job_meta.get("video_name", "output")
             run_output   = job_meta.get("run_output", "")
@@ -573,6 +644,8 @@ with tab_run:
                 "lip_sync_errors":       result.get("lip_sync_errors", {}),
                 "lip_synced_mkvs":       result.get("lip_synced_mkvs", {}),
                 "voice_cloning_note":    result.get("voice_cloning_note"),
+                "warnings":              result.get("warnings", []),
+                "language_errors":       result.get("language_errors", {}),
                 "video_path":            job_meta.get("video_path", ""),
                 "video_name":            video_name,
                 "run_output":            run_output,
@@ -586,6 +659,9 @@ with tab_run:
             if st.button("Clear and try again"):
                 del st.session_state["active_job_id"]
                 st.rerun()
+
+        else:
+            _job_status_panel(job_id)
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # Results display – persistent via session state
@@ -608,8 +684,13 @@ with tab_run:
         st.divider()
         st.subheader("📦 Results")
 
+        for lang, err in res.get("language_errors", {}).items():
+            lang_name = TARGET_LANGUAGES.get(lang, {}).get("name", lang)
+            st.error(f"**{lang_name}** could not be dubbed — {err}")
         if res.get("voice_cloning_note"):
             st.warning(f"🎙️ {res['voice_cloning_note']}.", icon="⚠️")
+        for msg in res.get("warnings", []):
+            st.warning(msg, icon="⚠️")
 
         # ── Video preview with dubbed audio + subtitle overlay ──────
         st.markdown("##### 🎬 Video Preview")
@@ -708,12 +789,9 @@ with tab_run:
                 lang_name = ALL_LANGUAGES.get(lang_code, {}).get("name", lang_code)
                 with ls_dl_cols[i]:
                     if os.path.isfile(ls_mkv):
-                        with open(ls_mkv, "rb") as f:
-                            ls_bytes = f.read()
-                        size_mb = len(ls_bytes) / (1024 * 1024)
                         st.download_button(
-                            f"⬇ {lang_name} lip-sync MKV ({size_mb:.1f} MB)",
-                            data=ls_bytes,
+                            f"⬇ {lang_name} lip-sync MKV ({_size_mb(ls_mkv):.1f} MB)",
+                            data=_read_on_click(ls_mkv),
                             file_name=os.path.basename(ls_mkv),
                             mime="video/x-matroska",
                             type="primary",
@@ -725,12 +803,9 @@ with tab_run:
         # Original multi-language MKV (all audio tracks, no lip-sync video)
         if mkv_path and os.path.isfile(mkv_path):
             label = "⬇ Download multi-language MKV (original video)" if lip_synced_mkvs else "⬇ Download dubbed video"
-            with open(mkv_path, "rb") as f:
-                mkv_bytes = f.read()
-            size_mb = len(mkv_bytes) / (1024 * 1024)
             st.download_button(
-                f"{label} ({size_mb:.1f} MB)",
-                data=mkv_bytes,
+                f"{label} ({_size_mb(mkv_path):.1f} MB)",
+                data=_read_on_click(mkv_path),
                 file_name=os.path.basename(mkv_path),
                 mime="video/x-matroska",
                 type="secondary" if lip_synced_mkvs else "primary",
@@ -763,12 +838,10 @@ with tab_run:
                 lang_name = TARGET_LANGUAGES.get(lang, {}).get("name", lang)
                 with tts_cols[i]:
                     if os.path.isfile(path):
-                        with open(path, "rb") as f:
-                            audio_bytes = f.read()
-                        st.audio(audio_bytes, format="audio/mpeg")
+                        st.audio(path, format="audio/mpeg")
                         st.download_button(
                             f"⬇ {lang_name} audio",
-                            data=audio_bytes,
+                            data=_read_on_click(path),
                             file_name=os.path.basename(path),
                             mime="audio/mpeg",
                         )
@@ -800,12 +873,9 @@ with tab_run:
                 with ls_cols[i]:
                     if os.path.isfile(path):
                         st.video(path)
-                        with open(path, "rb") as f:
-                            vid_bytes = f.read()
-                        size_mb = len(vid_bytes) / (1024 * 1024)
                         st.download_button(
-                            f"⬇ {lang_name} lip-sync ({size_mb:.1f} MB)",
-                            data=vid_bytes,
+                            f"⬇ {lang_name} lip-sync ({_size_mb(path):.1f} MB)",
+                            data=_read_on_click(path),
                             file_name=os.path.basename(path),
                             mime="video/mp4",
                         )

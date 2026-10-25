@@ -2,9 +2,10 @@
 Timing tests that run real ffmpeg on synthetic audio (tones + silence).
 
 These guard the bugs where (a) a segment bleeding into the following gap
-shifted every later segment, (b) a VAD-trimmed segment pulled every later
+shifted every later segment, (b) a shortened segment pulled every later
 segment earlier, and (c) "-v error" hid silencedetect/volumedetect output so
-the VAD trim, silence splitter and music gate never ran.
+silence-based features never ran — plus the natural-speed, real-onset and
+even-loudness behaviour of the aligner.
 """
 
 import os
@@ -15,7 +16,7 @@ import pytest
 
 from src.transcriber import Segment, split_segments_at_silences, _snap_to_word_boundary
 from src import audio_aligner
-from src.audio_aligner import align_dubbed_audio, _voiced_end_in_window
+from src.audio_aligner import MIN_TEMPO, align_dubbed_audio, _loudness
 from src.audio_separator import mix_audio_tracks
 
 needs_ffmpeg = pytest.mark.skipif(
@@ -31,8 +32,9 @@ def _ffmpeg(*args: str) -> None:
     subprocess.run(["ffmpeg", "-y", *args], capture_output=True, check=True)
 
 
-def _tone(path: str, dur: float, freq: int = 440) -> str:
-    _ffmpeg("-f", "lavfi", "-i", f"sine=f={freq}:d={dur}", "-ar", "48000", "-ac", "1", path)
+def _tone(path: str, dur: float, freq: int = 440, volume_db: float = 0.0) -> str:
+    _ffmpeg("-f", "lavfi", "-i", f"sine=f={freq}:d={dur}", "-af", f"volume={volume_db}dB",
+            "-ar", "48000", "-ac", "1", path)
     return path
 
 
@@ -83,25 +85,42 @@ class TestAlignmentDoesNotDrift:
         onset = min(t for t in _onsets(out) if t > 1.0)
         assert onset == pytest.approx(5.0, abs=ONSET_TOLERANCE_S)
 
-    def test_vad_trim_does_not_pull_next_segment_earlier(self, tmp_path):
-        # Speaker talks 0–3 s then pauses until the 10 s window ends; 2 s of
-        # TTS triggers the VAD trim.  Segment 1 must still start at 12.0 s.
-        src = _concat(
-            str(tmp_path / "src.wav"),
-            _tone(str(tmp_path / "speech.wav"), 3.0),
-            _silence(str(tmp_path / "pause.wav"), 13.0),
-        )
+    def test_short_sentence_keeps_natural_speed_and_next_stays_on_time(self, tmp_path):
+        # 2 s of TTS for a 10 s window: slowed by at most MIN_TEMPO (not
+        # stretched to fill), and segment 1 still starts at exactly 12.0 s.
         b0 = _tone(str(tmp_path / "b0.wav"), 2.0)
         b1 = _tone(str(tmp_path / "b1.wav"), 2.0, 880)
         out = str(tmp_path / "out.mp3")
         align_dubbed_audio(
             [Segment(0.0, 10.0, "x"), Segment(12.0, 14.0, "y")], {0: b0, 1: b1}, 16.0, out,
-            source_audio_path=src,
         )
-        # The trim really happened: segment 0 fills the voiced 3.3 s, not 2 s + padding
-        assert _offsets(out)[0] == pytest.approx(3.3, abs=ONSET_TOLERANCE_S)
+        assert _offsets(out)[0] == pytest.approx(2.0 / MIN_TEMPO, abs=ONSET_TOLERANCE_S)
         onset = min(t for t in _onsets(out) if t > 1.0)
         assert onset == pytest.approx(12.0, abs=ONSET_TOLERANCE_S)
+
+    def test_sentence_starts_where_the_speech_really_starts(self, tmp_path):
+        # Whisper says 2.0 s but the speaker is silent until 2.4 s
+        src = _concat(
+            str(tmp_path / "src.wav"),
+            _silence(str(tmp_path / "lead.wav"), 2.4),
+            _tone(str(tmp_path / "speech.wav"), 3.0),
+            _silence(str(tmp_path / "tail.wav"), 4.6),
+        )
+        dub = _tone(str(tmp_path / "dub.wav"), 2.5)
+        out = str(tmp_path / "out.mp3")
+        align_dubbed_audio([Segment(2.0, 5.4, "x")], {0: dub}, 10.0, out, source_audio_path=src)
+        assert _onsets(out)[0] == pytest.approx(2.4, abs=ONSET_TOLERANCE_S)
+
+    def test_sentences_come_out_equally_loud(self, tmp_path):
+        quiet = _tone(str(tmp_path / "quiet.wav"), 2.0, volume_db=-10)
+        loud = _tone(str(tmp_path / "loud.wav"), 2.0, 880, volume_db=0)
+        out = str(tmp_path / "out.wav")
+        align_dubbed_audio([Segment(0.0, 2.5, "x"), Segment(4.0, 6.5, "y")],
+                           {0: quiet, 1: loud}, 8.0, out)
+        first, second = (str(tmp_path / f"part{i}.wav") for i in (0, 1))
+        _ffmpeg("-i", out, "-ss", "0.2", "-t", "1.6", first)
+        _ffmpeg("-i", out, "-ss", "4.2", "-t", "1.6", second)
+        assert _loudness(first)[0] == pytest.approx(_loudness(second)[0], abs=1.0)
 
     def test_output_has_exact_total_duration(self, tmp_path):
         a0 = _tone(str(tmp_path / "a0.wav"), 4.0)
@@ -122,10 +141,6 @@ class TestSilenceDetectionIsActive:
             tone, _silence(str(tmp_path / "s4.wav"), 4.0),
             tone, _silence(str(tmp_path / "s6.wav"), 6.0),
         )
-
-    def test_voiced_end_finds_trailing_silence(self, speech_pause_speech, tmp_path):
-        voiced_end = _voiced_end_in_window(speech_pause_speech, 0.0, 16.0, str(tmp_path))
-        assert voiced_end == pytest.approx(10.3, abs=0.15)
 
     def test_splitter_splits_at_internal_pause(self, speech_pause_speech):
         text = "alpha beta gamma delta, epsilon zeta eta theta"

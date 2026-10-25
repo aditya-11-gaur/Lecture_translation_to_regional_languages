@@ -12,7 +12,6 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 # Register it in the dict below so the rest of the app picks it up.
 
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GCP_API_KEY    = os.getenv("GCP_API_KEY", "")
 
 # Master registry: engine_id → { display name, env‑var name, key value, capabilities }
@@ -24,7 +23,6 @@ GCP_API_KEY    = os.getenv("GCP_API_KEY", "")
 # key = "local" means no API key needed (runs locally)
 ENGINE_REGISTRY: dict[str, dict] = {
     "whisper": {"name": "Whisper (Local)",               "env_var": None,              "key": "local",       "capabilities": ["stt"]},
-    "gemini":  {"name": "Google Gemini",                 "env_var": "GEMINI_API_KEY",  "key": GEMINI_API_KEY, "capabilities": ["stt", "translate"]},
     "sarvam":  {"name": "Sarvam AI",                     "env_var": "SARVAM_API_KEY",  "key": SARVAM_API_KEY, "capabilities": ["stt", "translate"]},
     "gcp":     {"name": "Google Cloud (Translation+TTS)", "env_var": "GCP_API_KEY",    "key": GCP_API_KEY,   "capabilities": ["translate"]},
 }
@@ -51,14 +49,14 @@ def get_default_engine(capability: str | None = None) -> str:
     """Return the best default engine for a given capability."""
     available = get_available_engines(capability)
     if not available:
-        return "gemini"          # will fail at call-time with a clear error
+        return "whisper" if capability == "stt" else "sarvam"   # fails at call time with a clear error
     # For STT prefer whisper (word-level timestamps, no gaps), for translate prefer gcp/sarvam
     if capability == "stt":
-        preference = ("whisper", "gemini", "sarvam")
+        preference = ("whisper", "sarvam")
     elif capability == "translate":
-        preference = ("sarvam", "gcp", "gemini")
+        preference = ("sarvam", "gcp")
     else:
-        preference = ("sarvam" , "gemini", "whisper")
+        preference = ("sarvam", "whisper")
     for preferred in preference:
         if preferred in available:
             return preferred
@@ -121,6 +119,16 @@ DEFAULT_TTS_ENGINE    = "sarvam_vc"  # Sarvam AI TTS + OpenVoice v2 voice clonin
 SEPARATE_MUSIC        = True        # Always separate background music with Demucs
 ENABLE_VOICE_CLONING  = True        # Apply OpenVoice v2 tone-color transfer by default
 ENABLE_LIP_SYNC       = True       # Wav2Lip lip synchronisation (requires Wav2Lip + checkpoint)
+
+# ─── Job scheduling (DAG executor) ───────────────────────────
+# Every job is split into stages that each need one resource; the executor
+# starts a stage as soon as its inputs are ready and a slot is free, across
+# all running jobs (e.g. one job's TTS calls while another uses the GPU).
+MAX_CONCURRENT_JOBS = 2            # jobs whose stages may run at the same time
+MAX_WAITING_JOBS    = 1            # further jobs allowed to wait for a free slot
+DAG_GPU_SLOTS = 1                  # Demucs / Whisper / OpenVoice / XTTS / Wav2Lip (4 GB VRAM)
+DAG_CPU_SLOTS = max(2, (os.cpu_count() or 4) // 2)   # ffmpeg, alignment, mixing
+DAG_API_SLOTS = 4                  # concurrent Sarvam / Google API stages
 
 # ─── Caching ─────────────────────────────────────────────────
 ENABLE_CACHE = True                # Cache intermediate results to allow resume

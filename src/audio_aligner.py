@@ -3,79 +3,70 @@ audio_aligner.py
 ────────────────
 Temporal alignment for dubbed audio.
 
-Takes per-segment TTS audio files and stretches / compresses each one so that
-it fills the time window of the corresponding original English segment.
-The result is a full-length audio track (same duration as the source) where
-each dubbed sentence plays at the same moment the English sentence was spoken.
+Takes per-sentence TTS audio files and lays them out on a full-length track
+so each dubbed sentence plays when the English sentence was spoken.
 
-Approach   (informed by research)
+Approach
 ────────
-  This module uses the **Rubber Band** library (via ffmpeg's ``rubberband``
-  audio filter) for high-quality, pitch-preserving time-stretching:
-
-  • **Phase-vocoder based** – much higher quality than ffmpeg's ``atempo``
-    filter, especially for speech.  Preserves pitch, formants, and
-    transient crispness.
-  • **Formant preservation** – ``formant=preserved`` keeps vowel quality
-    natural even at extreme stretch ratios.
-  • **Naturalness bounds** – Research ("Dubbing in Practice", Brannon et al.
-    2022) shows that isochronic constraints should not sacrifice vocal
-    naturalness.  We therefore limit the tempo ratio to
-    ``[MIN_TEMPO, MAX_TEMPO]`` (default 0.65×–1.6×).  When the TTS audio
-    exceeds these bounds the segment is stretched to the limit and then:
-      – if too short → silence is padded at the end;
-      – if too long  → the audio is hard-truncated to the target window.
-  • **Lossless intermediate format** – all intermediate files use 48 kHz
-    PCM WAV to avoid cumulative re-encoding artefacts.
+  • **One natural speaking speed.**  TTS is synthesised at a single pace for
+    the whole lecture.  The aligner only nudges a sentence — at most
+    MIN_TEMPO (8 % slower) to fill a little of its own time, at most
+    MAX_TEMPO (15 % faster) to fit before the next sentence — so the voice
+    never audibly speeds up and slows down from sentence to sentence.
+  • **Pauses absorb the rest.**  A sentence that is still too long runs into
+    the pause after it and starts the next sentence up to MAX_DRIFT_S late;
+    the drift is recovered in later pauses.  Only beyond that does it speed
+    up further (HARD_MAX_TEMPO).  Speech is never truncated mid-word.
+  • **WSOLA time-stretching** (ffmpeg ``atempo``).  Measured on real lecture
+    dubs, Rubber Band's phase vocoder dropped estimated speech quality
+    (SQUIM PESQ) from 3.5 to 1.2–2.0 even at tempo ≈ 1.0; atempo kept 3.35.
+  • **Real speech onsets.**  Whisper places a sentence's first word ~0.3 s
+    early; when the source audio is silent at that point, the sentence
+    starts where the speech actually resumes (up to ONSET_SNAP_S later).
+  • **Even loudness.**  Every sentence is normalised to TARGET_LUFS.
+  • **Lossless intermediates** (48 kHz PCM); the output codec follows the
+    output file's extension (.flac / .wav / .mp3).
 """
 
 from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import wave
 
 from src.transcriber import Segment
-from src.utils import is_rubberband_available
 
 logger = logging.getLogger("nptel_pipeline")
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-# Tempo limits to preserve natural-sounding speech.
-# With duration-aware TTS (two-pass), the raw mismatch is typically small.
-# Rubber Band fine-tunes.  Bounds are wider than pure-duration-aware would
-# need, as a safety net for CPS estimation errors.
-# tempo < 1 → slow down (TTS too fast);  tempo > 1 → speed up (TTS too slow).
-MIN_TEMPO = 0.55   # never slow down more than ~45 % (~1.82× stretch)
-MAX_TEMPO = 1.60   # never speed up more than ~60 %
+# Speaking-rate limits (tempo > 1 ⇒ faster).  Kept narrow on purpose: before
+# this, per-sentence speed control made the heard rate swing 8–17 chars/s.
+MIN_TEMPO = 0.92        # at most 8 % slower
+MAX_TEMPO = 1.15        # at most 15 % faster before borrowing the next pause
+HARD_MAX_TEMPO = 1.35   # only when the dub would otherwise run MAX_DRIFT_S late
+MAX_DRIFT_S = 1.5       # how late a sentence may start vs. the original
 
-# Ratio below which rubber-band stretching is skipped entirely.
-# When TTS audio is less than NATURAL_SPEED_CUTOFF × target duration,
-# stretching would produce incomprehensible slow speech. Instead:
-# play TTS at natural speed and pad the remainder with silence.
-# Lowered from 0.45 → 0.25 so we try to rubber-band before giving up.
-NATURAL_SPEED_CUTOFF = 0.25
+# A sentence always leaves at least this much silence before the next one.
+MIN_PAUSE_S = 0.15
+
+# Move a sentence start at most this far forward to the real speech onset.
+ONSET_SNAP_S = 0.6
+
+# Loudness every sentence is normalised to (and the gain limits for it).
+TARGET_LUFS = -20.0
+MAX_GAIN_DB = 12.0
+PEAK_CEILING_DBFS = -1.0
 
 # Intermediate sample rate (Hz)
 INTERMEDIATE_SR = 48_000
 
-# Cross-fade duration at segment boundaries (ms)
-CROSSFADE_MS = 50    # 50 ms – smooths transitions between speech segments
-
-# Fade-out applied when audio is hard-truncated (ms)
-FADE_OUT_MS = 300    # 300 ms – longer fade prevents the "voice snap" artefact
-
-# When a segment is too long, allow it to bleed into the inter-segment gap
-# by up to this many seconds (instead of hard-truncation).
-OVERLAP_TOLERANCE_S = 1.5
-
-# A bleeding segment always leaves at least this much silence before the
-# next sentence so the two don't run together.
-MIN_PAUSE_S = 0.15
+# Fade at piece boundaries (ms) – avoids clicks between sentences / silence
+CROSSFADE_MS = 50
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -103,63 +94,12 @@ def _wav_duration(wav_path: str) -> float:
         return _get_duration(wav_path)
 
 
-def _rubberband_stretch(
-    input_path: str,
-    tempo: float,
-    output_path: str,
-) -> str:
-    """
-    Time-stretch *input_path* by *tempo* using the Rubber Band filter.
-
-    ``tempo`` > 1 ⇒ audio gets shorter (faster playback).
-    ``tempo`` < 1 ⇒ audio gets longer  (slower playback).
-
-    Falls back to ffmpeg's ``atempo`` filter when Rubber Band is not available.
-
-    Returns *output_path*.
-    """
-    if is_rubberband_available():
-        # Build filter string with Rubber Band options tuned for speech:
-        #   - formant=preserved  → keep vowel / speech-formant quality
-        #   - transients=smooth  → fewer artefacts for spoken-word content
-        #   - detector=soft      → better for non-percussive (speech) audio
-        #   - window=long        → higher frequency resolution
-        #   - pitchq=quality     → best pitch estimation quality
-        rb_filter = (
-            f"rubberband=tempo={tempo:.6f}"
-            ":formant=preserved"
-            ":transients=smooth"
-            ":detector=soft"
-            ":window=long"
-            ":pitchq=quality"
-        )
-        af_filter = rb_filter
-    else:
-        # Fallback: ffmpeg's built-in atempo filter
-        # atempo only supports [0.5, 100.0]; chain multiple for extreme values
-        logger.debug("Rubber Band not available, falling back to atempo")
-        af_filter = _build_atempo_chain(tempo)
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-af", af_filter,
-        "-ar", str(INTERMEDIATE_SR),
-        "-ac", "1",
-        "-c:a", "pcm_s16le",
-        "-vn",
-        output_path,
-    ]
-    subprocess.run(cmd, capture_output=True, check=True)
-    return output_path
-
-
 def _build_atempo_chain(tempo: float) -> str:
     """
     Build an ffmpeg ``atempo`` filter chain for the given tempo ratio.
 
-    The ``atempo`` filter only accepts values in [0.5, 100.0], so extreme
-    ratios need to be chained (e.g. 0.3 → atempo=0.5,atempo=0.6).
+    The ``atempo`` filter only accepts values in [0.5, 100.0]; chain multiple
+    for extreme values (e.g. 0.3 → atempo=0.5,atempo=0.6).
     """
     if tempo <= 0:
         return "atempo=1.0"
@@ -175,142 +115,54 @@ def _build_atempo_chain(tempo: float) -> str:
     return ",".join(parts)
 
 
-def _time_stretch_segment(
-    input_path: str, target_duration: float, output_path: str,
-) -> str:
-    """
-    Time-stretch *input_path* so that the result fits within
-    *target_duration* seconds.
-
-    The tempo ratio is clamped to [MIN_TEMPO, MAX_TEMPO] to protect
-    naturalness.  When clamping is active:
-      • ratio was below MIN_TEMPO (audio far too short) → stretch to limit,
-        then pad with silence to reach target_duration.
-      • ratio was above MAX_TEMPO (audio far too long) → compress to limit,
-        then hard-truncate to target_duration.
-
-    Returns *output_path*.
-    """
-    actual_dur = _get_duration(input_path)
-
-    if actual_dur <= 0 or target_duration <= 0:
-        # Nothing useful — just copy
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", input_path, "-c:a", "pcm_s16le",
-             "-ar", str(INTERMEDIATE_SR), "-ac", "1", output_path],
-            capture_output=True, check=True,
-        )
-        return output_path
-
-    raw_tempo = actual_dur / target_duration  # >1 ⇒ need to speed up
-
-    # If close enough to 1×, just re-encode without stretching
-    if 0.97 <= raw_tempo <= 1.03:
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", input_path, "-c:a", "pcm_s16le",
-             "-ar", str(INTERMEDIATE_SR), "-ac", "1", output_path],
-            capture_output=True, check=True,
-        )
-        return output_path
-
-    # ── Natural-speed fallback for extreme under-duration ───────────
-    # When TTS audio is far shorter than the target window (raw_tempo <
-    # NATURAL_SPEED_CUTOFF), rubber-band would need to stretch more than
-    # 1/NATURAL_SPEED_CUTOFF ≈ 2.2×, which produces incomprehensible speech.
-    # Better to play at natural speed and fill the gap with silence.
-    if raw_tempo < NATURAL_SPEED_CUTOFF:
-        tmp_dir = os.path.dirname(output_path) or tempfile.gettempdir()
-        nat_path = os.path.join(tmp_dir, "_nat_" + os.path.basename(output_path))
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", input_path, "-c:a", "pcm_s16le",
-             "-ar", str(INTERMEDIATE_SR), "-ac", "1", nat_path],
-            capture_output=True, check=True,
-        )
-        pad_dur = target_duration - actual_dur
-        sil_path = os.path.join(tmp_dir, "_nspad_" + os.path.basename(output_path))
-        _generate_silence(pad_dur, sil_path)
-        _concat_two(nat_path, sil_path, output_path)
-        _safe_remove(nat_path, sil_path)
-        logger.debug(
-            "Natural-speed fallback: %.2fs TTS → %.2fs window (silence pad %.2fs)",
-            actual_dur, target_duration, pad_dur,
-        )
-        return output_path
-
-    clamped_tempo = max(MIN_TEMPO, min(MAX_TEMPO, raw_tempo))
-    needs_pad   = raw_tempo < MIN_TEMPO   # stretched audio shorter than window
-    needs_trunc = raw_tempo > MAX_TEMPO   # compressed audio longer than window
-
-    # Log stretch ratio so we can diagnose audio quality issues
-    stretch_factor = 1.0 / raw_tempo   # >1 means audio was stretched/slowed
-    if abs(raw_tempo - 1.0) > 0.03:   # skip near-unity (already filtered above)
-        if needs_pad or needs_trunc:
-            logger.info(
-                "  Align seg: actual=%.2fs target=%.2fs ratio=%.2f "
-                "(CLAMPED from %.2f) %s",
-                actual_dur, target_duration, clamped_tempo, raw_tempo,
-                "→ silence pad" if needs_pad else "→ truncated",
-            )
-        else:
-            level = "WARNING" if stretch_factor > 1.35 or stretch_factor < 0.80 else "DEBUG"
-            getattr(logger, level.lower())(
-                "  Align seg: actual=%.2fs target=%.2fs → stretch x%.2f (tempo=%.2f)",
-                actual_dur, target_duration, stretch_factor, raw_tempo,
-            )
-
-    tmp_dir = os.path.dirname(output_path) or tempfile.gettempdir()
-    stretched = os.path.join(tmp_dir, "_rb_tmp_" + os.path.basename(output_path))
-
-    _rubberband_stretch(input_path, clamped_tempo, stretched)
-
-    stretched_dur = _get_duration(stretched)
-
-    if needs_pad and stretched_dur < target_duration:
-        # Pad silence at the end to fill remaining time
-        pad_dur = target_duration - stretched_dur
-        silence = os.path.join(tmp_dir, "_pad_" + os.path.basename(output_path))
-        _generate_silence(pad_dur, silence)
-        # Concatenate via filter (avoids concat demuxer format issues)
-        _concat_two(stretched, silence, output_path)
-        _safe_remove(stretched, silence)
-
-    elif needs_trunc and stretched_dur > target_duration:
-        # Hard-truncate to target_duration with a gentle fade-out
-        fade_sec = FADE_OUT_MS / 1000.0
-        fade_start = max(0, target_duration - fade_sec)
-        af = f"afade=t=out:st={fade_start:.4f}:d={fade_sec:.4f}"
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", stretched,
-            "-af", af,
-            "-t", f"{target_duration:.4f}",
-            "-c:a", "pcm_s16le",
-            output_path,
-        ]
-        subprocess.run(cmd, capture_output=True, check=True)
-        _safe_remove(stretched)
-
-    else:
-        # Stretched file is close to target — use as-is
-        os.replace(stretched, output_path)
-
-    return output_path
+def _codec_args(path: str) -> list[str]:
+    """ffmpeg codec arguments for an output file, chosen by its extension."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".flac":
+        return ["-c:a", "flac"]
+    if ext == ".wav":
+        return ["-c:a", "pcm_s16le"]
+    return ["-c:a", "libmp3lame", "-b:a", "192k"]
 
 
-def _concat_two(a: str, b: str, out: str) -> None:
-    """Concatenate two WAV files into *out* via the concat filter."""
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", a,
-        "-i", b,
-        "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[outa]",
-        "-map", "[outa]",
-        "-c:a", "pcm_s16le",
-        "-ar", str(INTERMEDIATE_SR),
-        "-ac", "1",
-        out,
-    ]
+def _loudness(audio_path: str) -> tuple[float | None, float | None]:
+    """(integrated loudness LUFS, true peak dBFS) via ffmpeg ebur128."""
+    r = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", audio_path,
+         "-af", "ebur128=peak=true", "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    summary = r.stderr[r.stderr.rfind("Summary:"):]
+    lufs = re.search(r"I:\s+(-?[\d.]+) LUFS", summary)
+    peak = re.search(r"Peak:\s+(-?[\d.]+) dBFS", summary)
+    return (float(lufs.group(1)) if lufs else None,
+            float(peak.group(1)) if peak else None)
+
+
+def _normalising_gain(audio_path: str) -> float:
+    """Gain (dB) that brings a sentence to TARGET_LUFS without clipping."""
+    lufs, peak = _loudness(audio_path)
+    if lufs is None or lufs < -60:          # (near-)silent or too short to measure
+        return 0.0
+    gain = TARGET_LUFS - lufs
+    if peak is not None:
+        gain = min(gain, PEAK_CEILING_DBFS - peak)
+    return max(-MAX_GAIN_DB, min(MAX_GAIN_DB, gain))
+
+
+def _render_sentence(input_path: str, tempo: float, gain_db: float, output_path: str) -> str:
+    """Re-time (WSOLA) and level one sentence into an intermediate WAV."""
+    filters = []
+    if abs(tempo - 1.0) > 0.005:
+        filters.append(_build_atempo_chain(tempo))
+    if abs(gain_db) > 0.1:
+        filters.append(f"volume={gain_db:.2f}dB")
+    cmd = ["ffmpeg", "-y", "-i", input_path]
+    if filters:
+        cmd += ["-af", ",".join(filters)]
+    cmd += ["-ar", str(INTERMEDIATE_SR), "-ac", "1", "-c:a", "pcm_s16le", output_path]
     subprocess.run(cmd, capture_output=True, check=True)
+    return output_path
 
 
 def _generate_silence(
@@ -330,45 +182,19 @@ def _generate_silence(
     return output_path
 
 
-def _enforce_duration(input_wav: str, target_dur: float, output_mp3: str) -> None:
+def _enforce_duration(input_wav: str, target_dur: float, output_path: str) -> None:
     """
-    Ensure *input_wav* is exactly *target_dur* seconds and write to
-    *output_mp3*.  Pads with silence if short, trims if long.
+    Write *input_wav* to *output_path* at exactly *target_dur* seconds
+    (padding with silence or trimming), encoded per the output extension.
     """
-    actual = _get_duration(input_wav)
-    diff = actual - target_dur
-
-    if abs(diff) < 0.05:
-        # Close enough – just encode
-        cmd = [
-            "ffmpeg", "-y", "-i", input_wav,
-            "-c:a", "libmp3lame", "-q:a", "2",
-            output_mp3,
-        ]
-        subprocess.run(cmd, capture_output=True, check=True)
-    elif diff > 0:
-        # Audio is TOO LONG → trim
-        cmd = [
-            "ffmpeg", "-y", "-i", input_wav,
-            "-t", f"{target_dur:.4f}",
-            "-c:a", "libmp3lame", "-q:a", "2",
-            output_mp3,
-        ]
-        subprocess.run(cmd, capture_output=True, check=True)
-        logger.debug("Trimmed %.2fs to match target %.2fs", diff, target_dur)
-    else:
-        # Audio is TOO SHORT → pad silence at end
-        pad_dur = target_dur - actual
-        # Use the apad filter to extend to exact sample count, then trim
-        cmd = [
-            "ffmpeg", "-y", "-i", input_wav,
-            "-af", f"apad=whole_dur={target_dur}",
-            "-t", f"{target_dur:.4f}",
-            "-c:a", "libmp3lame", "-q:a", "2",
-            output_mp3,
-        ]
-        subprocess.run(cmd, capture_output=True, check=True)
-        logger.debug("Padded %.2fs to match target %.2fs", pad_dur, target_dur)
+    cmd = [
+        "ffmpeg", "-y", "-i", input_wav,
+        "-af", f"apad=whole_dur={target_dur:.4f}",
+        "-t", f"{target_dur:.4f}",
+        *_codec_args(output_path),
+        output_path,
+    ]
+    subprocess.run(cmd, capture_output=True, check=True)
 
 
 def _safe_remove(*paths: str) -> None:
@@ -380,98 +206,81 @@ def _safe_remove(*paths: str) -> None:
             pass
 
 
-def _voiced_end_in_window(
-    source_audio_path: str,
-    seg_start: float,
-    seg_end: float,
-    tmp_dir: str,
-    silence_db: float = -38.0,
-    min_silence_dur: float = 0.6,
-) -> float:
+def _silences(source_audio_path: str, silence_db: float = -38.0,
+              min_silence_dur: float = 0.2) -> list[tuple[float, float]]:
+    """(start, end) of every silence in the source audio (ffmpeg silencedetect)."""
+    # silencedetect reports at info level — don't pass "-v error" here
+    r = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", source_audio_path,
+         "-af", f"silencedetect=noise={silence_db}dB:d={min_silence_dur}",
+         "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    out, start = [], None
+    for line in r.stderr.splitlines():
+        if "silence_start:" in line:
+            start = float(line.split("silence_start:")[1].split()[0])
+        elif "silence_end:" in line and start is not None:
+            out.append((start, float(line.split("silence_end:")[1].split("|")[0])))
+            start = None
+    return out
+
+
+def _snap_to_onset(start: float, silences: list[tuple[float, float]]) -> float:
     """
-    Find when the speaker last spoke within the segment window [seg_start, seg_end].
-
-    Uses ffmpeg silencedetect on the source audio (original lecture) to locate
-    the final non-silent frame.  Returns the time offset from seg_start at which
-    the last voiced speech ends (plus a small 300 ms tail buffer).
-
-    When analysis fails, falls back to the full window duration so that normal
-    stretching behaviour is preserved.
-
-    This is the key correction for large windows that include long trailing
-    silences (e.g. the professor paused for 30 s after a single sentence):
-    the dubbed TTS audio should fill the SPEAKING portion, not the full window.
+    If *start* falls inside a silence that ends within ONSET_SNAP_S, return
+    that silence's end (where the speech really starts); else *start*.
     """
-    window_dur = seg_end - seg_start
-    if window_dur <= 0:
-        return window_dur
+    for s, e in silences:
+        if s - 0.05 <= start < e and e - start <= ONSET_SNAP_S:
+            return e
+    return start
 
-    seg_wav = os.path.join(tmp_dir, f"_vad_{seg_start:.2f}.wav")
-    try:
-        # Extract the source window at 16 kHz mono (fast, enough for VAD)
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", source_audio_path,
-             "-ss", f"{seg_start:.3f}", "-t", f"{window_dur:.3f}",
-             "-ar", "16000", "-ac", "1", seg_wav],
-            capture_output=True, check=True,
-        )
 
-        # silencedetect reports at info level — don't pass "-v error" here
-        result = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-nostats", "-i", seg_wav,
-             "-af", f"silencedetect=noise={silence_db}dB:d={min_silence_dur}",
-             "-f", "null", "/dev/null"],
-            capture_output=True, text=True,
-        )
+def _plan_timing(
+    starts: list[float],
+    ends: list[float],
+    durations: list[float | None],
+    total_duration: float,
+) -> list[tuple[float, float] | None]:
+    """
+    Decide when each sentence plays and its tempo.
 
-        # Parse silence_start / silence_end pairs
-        silence_intervals: list[tuple[float, float]] = []
-        s_start: float | None = None
-        for line in result.stderr.split("\n"):
-            if "silence_start" in line:
-                try:
-                    s_start = float(line.split("silence_start:")[1].strip().split()[0])
-                except (IndexError, ValueError):
-                    pass
-            elif "silence_end" in line and s_start is not None:
-                try:
-                    s_end = float(line.split("silence_end:")[1].strip().split("|")[0].strip())
-                    silence_intervals.append((s_start, s_end))
-                    s_start = None
-                except (IndexError, ValueError):
-                    pass
-        # Unclosed silence (extends to window end)
-        if s_start is not None:
-            silence_intervals.append((s_start, window_dur))
+    Args:
+        starts, ends:   preferred (original) times of each sentence.
+        durations:      natural length of each sentence's TTS, None if it has none.
+        total_duration: length of the track.
 
-        if not silence_intervals:
-            # No silence detected — voice fills the whole window
-            return window_dur
+    Returns:
+        (start, tempo) per sentence, None where there is no audio.
+    """
+    plan: list[tuple[float, float] | None] = []
+    cursor = 0.0
+    n = len(starts)
+    for i in range(n):
+        d = durations[i]
+        if not d:
+            plan.append(None)
+            continue
+        next_start = next((starts[j] for j in range(i + 1, n) if durations[j]), None)
+        start = max(starts[i], cursor + MIN_PAUSE_S if cursor > 0 else 0.0)
 
-        # Find trailing silence: the last silence block that reaches the window end
-        trailing_start = window_dur
-        for si_start, si_end in reversed(silence_intervals):
-            if si_end >= window_dur - 0.1:
-                trailing_start = si_start
-            else:
-                break  # non-trailing silence found; stop
+        # Fill a little of the sentence's own time — never noticeably slower
+        own = ends[i] - starts[i]
+        tempo = max(MIN_TEMPO, d / own) if 0 < d < own else 1.0
 
-        # Effective voiced end = start of trailing silence + 300 ms tail buffer
-        voiced_end = min(trailing_start + 0.30, window_dur)
-        logger.debug(
-            "VAD window %.1f–%.1f: voiced ends at +%.1fs / %.1fs",
-            seg_start, seg_end, voiced_end, window_dur,
-        )
-        return max(voiced_end, 1.0)  # always give at least 1 s target
-
-    except Exception as exc:
-        logger.debug("VAD voiced-end detection failed for %.1f–%.1f: %s", seg_start, seg_end, exc)
-        return window_dur
-    finally:
-        try:
-            os.remove(seg_wav)
-        except OSError:
-            pass
+        # Finish before the next sentence; past the end of the video no drift
+        deadline = (next_start - MIN_PAUSE_S) if next_start is not None else total_duration
+        drift_ok = MAX_DRIFT_S if next_start is not None else 0.0
+        if start + d / tempo > deadline:
+            budget = deadline - start
+            tempo = max(1.0, min(MAX_TEMPO, d / budget)) if budget > 0 else MAX_TEMPO
+            room = deadline + drift_ok - start
+            if start + d / tempo > deadline + drift_ok:
+                tempo = min(HARD_MAX_TEMPO, d / room) if room > 0 else HARD_MAX_TEMPO
+        plan.append((start, tempo))
+        cursor = start + d / tempo
+    return plan
 
 
 # ── Main public function ─────────────────────────────────────────────────────
@@ -486,126 +295,67 @@ def align_dubbed_audio(
     """
     Build a full-length dubbed audio track with proper temporal alignment.
 
-    Strategy (duration-aware pipeline):
-      1. TTS already targets roughly the right duration via SSML rate control.
-      2. This function fine-tunes via Rubber Band.
-      3. If source_audio_path is provided, VAD detects the actual voiced end
-         within each segment window.  For segments where the professor paused
-         significantly (TTS << window), the target is clamped to the voiced
-         portion — preventing long silent gaps mid-lecture.
-      4. Silence pads short segments; bleed tolerates slightly long ones.
-
     Args:
         original_segments:   The English Segment list (carries start/end times).
         segment_audio_files: Mapping of segment index → per-segment TTS audio path.
         total_duration:      Total duration (seconds) of the original audio/video.
-        output_path:         Where to write the aligned output audio (mp3).
-        source_audio_path:   Optional path to the original (vocals) audio. When
-                             provided, enables VAD-based voiced-end correction
-                             for large windows with short TTS.
+        output_path:         Where to write the aligned track (.flac/.wav/.mp3).
+        source_audio_path:   Optional original (vocals) audio; used to start each
+                             sentence at the real speech onset.
 
     Returns:
         Path to the generated full-length audio file.
     """
+    silences = _silences(source_audio_path) if source_audio_path else []
+    starts = [_snap_to_onset(s.start, silences) for s in original_segments]
+    ends = [max(s.end, st) for s, st in zip(original_segments, starts)]
+
     with tempfile.TemporaryDirectory(prefix="align_") as tmp_dir:
-        pieces: list[str] = []   # ordered list of WAV files to concat
-
-        # Where the assembled track actually ends so far.  Every gap is
-        # measured from here rather than from the previous segment's nominal
-        # end, so a piece that runs long (bleed) or short (VAD trim) can never
-        # shift the segments that follow it.
-        cursor = 0.0
-
-        # Pre-compute the gap *after* each segment (to the next segment's start).
-        # This lets us decide how much overlap we can tolerate.
-        gap_after: list[float] = []
+        sources: dict[int, str] = {}
+        durations: list[float | None] = []
         for idx in range(len(original_segments)):
-            if idx + 1 < len(original_segments):
-                gap_after.append(
-                    original_segments[idx + 1].start - original_segments[idx].end
-                )
+            path = segment_audio_files.get(idx)
+            if path and os.path.isfile(path):
+                sources[idx] = path
+                durations.append(_get_duration(path))
             else:
-                gap_after.append(total_duration - original_segments[idx].end)
+                durations.append(None)
 
-        for idx, seg in enumerate(original_segments):
-            gap = seg.start - cursor
+        plan = _plan_timing(starts, ends, durations, total_duration)
 
-            if gap < -0.05:
-                logger.warning(
-                    "Segment %d starts %.3fs before the previous audio ends; "
-                    "starting it at %.3fs instead",
-                    idx, -gap, cursor,
-                )
-
-            # Insert silence to fill the gap before this segment
-            if gap > 0.05:
+        pieces: list[str] = []   # ordered list of WAV files to concat
+        # Where the assembled track actually ends so far.  Every gap is
+        # measured from here, so a piece that comes out a few ms long or short
+        # can never shift the sentences that follow it.
+        cursor = 0.0
+        late = []
+        for idx, step in enumerate(plan):
+            if step is None:
+                continue
+            start, tempo = step
+            gap = start - cursor
+            if gap > 0.001:
                 sil_path = os.path.join(tmp_dir, f"sil_{idx:04d}.wav")
                 _generate_silence(gap, sil_path)
                 pieces.append(sil_path)
                 cursor += _wav_duration(sil_path)
 
-            if idx in segment_audio_files and os.path.isfile(segment_audio_files[idx]):
-                # If we're starting late, aim to still finish on time
-                target_dur = seg.end - max(seg.start, cursor)
-                if target_dur <= 0:
-                    target_dur = seg.end - seg.start
+            piece = os.path.join(tmp_dir, f"seg_{idx:04d}.wav")
+            _render_sentence(sources[idx], tempo, _normalising_gain(sources[idx]), piece)
+            pieces.append(piece)
+            cursor += _wav_duration(piece)
+            if start - starts[idx] > 0.3:
+                late.append(start - starts[idx])
+            if abs(tempo - 1.0) > 0.16:
+                logger.info("  Align seg %d: tempo %.2f (TTS %.2fs, window %.2fs)",
+                            idx, tempo, durations[idx], ends[idx] - starts[idx])
 
-                tts_dur = _get_duration(segment_audio_files[idx])
-                raw_ratio = tts_dur / target_dur if target_dur > 0 else 1.0
-
-                # ── VAD-based voiced-end correction ───────────────────────
-                # When the TTS is much shorter than the window (low ratio),
-                # the professor probably paused inside the window. Use the
-                # source audio to find when they actually stopped speaking,
-                # so TTS fills the voiced portion rather than the full window.
-                USE_VAD_THRESHOLD = 0.65  # apply when ratio < this
-                if (
-                    source_audio_path
-                    and raw_ratio < USE_VAD_THRESHOLD
-                    and target_dur > 4.0
-                ):
-                    voiced_end = _voiced_end_in_window(
-                        source_audio_path, seg.start, seg.end, tmp_dir,
-                    )
-                    # Only shrink the target (never expand beyond original window),
-                    # and never below the TTS's natural length — the window has
-                    # room, so there's no reason to speed the speech up.
-                    if voiced_end < target_dur * 0.85:
-                        new_target = max(voiced_end, tts_dur)
-                        logger.debug(
-                            "Seg %d: VAD-trimmed target %.1fs → %.1fs (saves %.1fs silence)",
-                            idx, target_dur, new_target, target_dur - new_target,
-                        )
-                        target_dur = new_target
-                        raw_ratio = tts_dur / target_dur if target_dur > 0 else 1.0
-
-                # ── Smart overlap: extend target if there's room after ──
-                # Allows the TTS audio to breathe into the gap instead of
-                # being stretched aggressively or hard-truncated.
-                available_bleed = min(
-                    max(gap_after[idx] - MIN_PAUSE_S, 0.0),
-                    OVERLAP_TOLERANCE_S,
-                )
-
-                if raw_ratio > MAX_TEMPO and available_bleed > 0.05:
-                    # TTS is longer than our stretch limit allows — use some
-                    # of the following gap instead of extreme compression
-                    extra = min(tts_dur / MAX_TEMPO - target_dur, available_bleed)
-                    effective_dur = target_dur + extra
-                    logger.debug(
-                        "Seg %d: bleed %.2fs into gap (ratio %.2f→%.2f)",
-                        idx, extra, raw_ratio, tts_dur / effective_dur,
-                    )
-                    target_dur = effective_dur
-
-                stretched_path = os.path.join(tmp_dir, f"seg_{idx:04d}_stretched.wav")
-                _time_stretch_segment(
-                    segment_audio_files[idx], target_dur, stretched_path,
-                )
-                pieces.append(stretched_path)
-                cursor += _wav_duration(stretched_path)
-            # No TTS for this segment → nothing to add; the next gap (measured
-            # from the cursor) fills its window with silence.
+        tempos = [t for _, t in filter(None, plan)]
+        if tempos:
+            logger.info(
+                "Alignment: %d sentences, tempo %.2f–%.2f, %d started late (max %.1fs)",
+                len(tempos), min(tempos), max(tempos), len(late), max(late, default=0.0),
+            )
 
         # Trailing silence after last segment
         trailing = total_duration - cursor
@@ -617,7 +367,7 @@ def align_dubbed_audio(
         if not pieces:
             raise ValueError("No audio pieces to assemble")
 
-        # ── Optional cross-fade between consecutive segment pieces ───────
+        # ── Short fades between consecutive pieces (no clicks) ───────────
         if CROSSFADE_MS > 0 and len(pieces) > 1:
             pieces = _apply_crossfades(pieces, tmp_dir)
 
@@ -627,7 +377,6 @@ def align_dubbed_audio(
             for p in pieces:
                 f.write(f"file '{p}'\n")
 
-        # Concat WAV intermediates → temporary WAV, then enforce exact duration
         raw_concat = os.path.join(tmp_dir, "raw_concat.wav")
         cmd = [
             "ffmpeg", "-y",
@@ -644,8 +393,6 @@ def align_dubbed_audio(
         # ── Enforce EXACT duration ───────────────────────────────────────
         _enforce_duration(raw_concat, total_duration, output_path)
 
-    # TemporaryDirectory auto-cleans everything
-
     size_kb = os.path.getsize(output_path) / 1024
     logger.info("Aligned audio → %s (%.0f KB)", output_path, size_kb)
     return output_path
@@ -655,12 +402,9 @@ def _apply_crossfades(
     pieces: list[str], tmp_dir: str,
 ) -> list[str]:
     """
-    Apply short cross-fades between adjacent audio pieces for smoother
-    transitions.  Returns a new list of piece paths (some may be replaced
-    with cross-faded versions).
-
-    We apply a tiny fade-out at the end of each segment and fade-in at the
-    start of the next.  This avoids discontinuity clicks.
+    Apply a short fade-in at the start and fade-out at the end of each piece
+    so joins between sentences and silence never click.  Returns the new
+    list of piece paths (same lengths as before).
     """
     fade_sec = CROSSFADE_MS / 1000.0
     result: list[str] = []
@@ -670,7 +414,7 @@ def _apply_crossfades(
         if i > 0:
             af_parts.append(f"afade=t=in:st=0:d={fade_sec:.4f}")
         try:
-            dur = _get_duration(piece)
+            dur = _wav_duration(piece)
         except Exception:
             dur = 0
         if i < len(pieces) - 1 and dur > fade_sec:

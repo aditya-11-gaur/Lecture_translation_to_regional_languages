@@ -9,7 +9,6 @@ language output.  This module provides:
 
   • A static glossary of common CS / Math / Engineering terms
   • A way to load custom glossaries from JSON files
-  • Prompt-building helpers for translation engines
   • Post-processing to verify terms were preserved
 """
 
@@ -157,35 +156,6 @@ class Glossary:
         if not self._pattern:
             return []
         return list(set(self._pattern.findall(text)))
-
-    def build_translation_prompt_section(
-        self, terms_in_use: list[str] | None = None,
-    ) -> str:
-        """
-        Build a prompt section instructing the translator to preserve terms.
-
-        Args:
-            terms_in_use: If given, only include these terms. Otherwise use all.
-        """
-        terms = terms_in_use or sorted(self.terms)
-        if not terms:
-            return ""
-
-        # Deduplicate and limit to reasonable size for prompt
-        unique_terms = sorted(set(terms))
-        if len(unique_terms) > 100:
-            unique_terms = unique_terms[:100]
-
-        return (
-            "\n\nIMPORTANT — Code-mixing / Technical Terms:\n"
-            "The following technical terms must be kept EXACTLY in English as-is. "
-            "Do NOT translate them, do NOT transliterate them, and do NOT add a "
-            "translation or transliteration in parentheses after them. "
-            "Just use the English term directly inside the target-language sentence. "
-            "For example, 'The algorithm is efficient' in Hindi → "
-            "'यह algorithm बहुत efficient है।' — NOT 'algorithm (एल्गोरिदम)'.\n"
-            "Terms to preserve: " + ", ".join(unique_terms)
-        )
 
     def extract_terms_from_segments(self, segments) -> list[str]:
         """Extract unique technical terms found across all segments."""

@@ -21,15 +21,6 @@ class TestTranscribeAudioDispatch:
         mock_whisper.assert_called_once()
         assert len(result) == 1
 
-    @patch("src.transcriber._transcribe_gemini")
-    def test_dispatches_to_gemini(self, mock_gemini):
-        mock_gemini.return_value = [
-            Segment(start=0.0, end=3.0, text="Hello"),
-        ]
-        result = transcribe_audio("fake.wav", method="gemini")
-        mock_gemini.assert_called_once()
-        assert len(result) == 1
-
     @patch("src.transcriber._transcribe_sarvam")
     def test_dispatches_to_sarvam(self, mock_sarvam):
         mock_sarvam.return_value = [

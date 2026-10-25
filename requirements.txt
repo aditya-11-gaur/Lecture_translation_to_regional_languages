@@ -1,13 +1,13 @@
 python-dotenv>=1.0.0
 requests>=2.31.0
-google-genai>=1.0.0
 pydub>=0.25.1
 srt>=3.5.3
-streamlit>=1.38.0
-edge-tts>=6.1.0
+streamlit>=1.56.0
 sarvamai>=0.1.25
 faster-whisper>=1.1.0
 pytest>=7.0.0
 demucs>=4.0.0
 TTS==0.22.0
 transformers==4.36.2
+numpy
+gdown

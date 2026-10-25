@@ -1,102 +1,106 @@
 # NPTEL Lecture Translation Pipeline
 
-Translate English NPTEL lecture videos into **Hindi**, **Telugu**, and **Odia** — with subtitles and dubbed audio.
+Dub English NPTEL lecture videos into **Hindi**, **Telugu** and **Odia** — subtitles,
+dubbed audio in the lecturer's own voice, optional lip sync, all in one MKV.
 
-## Pipeline Flow
+## Pipeline
+
+Each job is split into stages that form a DAG (`src/pipeline_dag.py`). Every stage
+needs one resource — **GPU**, **CPU** or **API** — and the executor
+(`src/dag_executor.py`) starts it as soon as its inputs are ready and a slot of that
+resource is free. Languages run side by side, and when two jobs are active they share
+the slots: one job's TTS calls run while the other job uses the GPU, but the GPU
+itself only ever runs one stage at a time.
 
 ```
-Input Video (.mp4)
-    │
-    ▼
-┌──────────────────┐
-│  Audio Extraction │  (ffmpeg)
-└────────┬─────────┘
-         ▼
-┌──────────────────┐
-│  English STT     │  (Sarvam / Gemini)
-│  + timestamps    │
-└────────┬─────────┘
-         ▼
-┌──────────────────┐
-│  Translation     │  (Sarvam / Gemini)
-│  → hi / te / od  │
-└────────┬─────────┘
-         ▼
-┌──────────────────────────────────────┐
-│  Subtitle Generation (.srt)          │
-│  en + hi + te + od with timestamps   │
-└────────┬─────────────────────────────┘
-         ▼
-┌──────────────────┐
-│  TTS Generation  │  (Sarvam)
-│  → hi / te / od  │
-└──────────────────┘
+extract (CPU) ─ demucs (GPU) ─ stt: Whisper (GPU) ─ subtitles_en (CPU)
+                                 │
+                                 └─ per language, in parallel:
+                                    translate (API) ─ subtitles (CPU)
+                                    tts (API) ─ clone voice (GPU) ─ align (CPU)
+                                    ─ match pitch (CPU) ─ mix music (CPU) ─ [lip sync (GPU)]
+                                                                           │
+                                                          mux MKV (CPU) ◄──┘
 ```
 
-## Setup
+| Stage | Tool |
+|-------|------|
+| Music separation | Demucs (`htdemucs`) |
+| Speech-to-text | faster-whisper (local) or Sarvam STT |
+| Translation | Sarvam `mayura:v1` in **code-mixed** mode (keeps technical terms in English) or Google Cloud Translation |
+| Text-to-speech | Sarvam `bulbul:v3`, Google Cloud TTS Neural2, or Coqui XTTS v2 — voice picked to match the lecturer's gender |
+| Voice cloning | OpenVoice v2 (needs a CUDA GPU) |
+| Alignment | One natural speaking speed (±8–15 % WSOLA nudges via ffmpeg `atempo`); pauses absorb timing differences; sentences start at the real speech onset; loudness evened out |
+| Lip sync | Wav2Lip |
+
+Hesitation fillers ("ah", "um") are removed before translation and from the subtitles.
+A failure in one language only drops that language; the job fails if a shared stage
+fails or no language produced audio.
+
+## Setup (Linux)
 
 ```bash
-# 1. Create virtual environment
-python -m venv .venv
-.venv\Scripts\activate        # Windows
-# source .venv/bin/activate   # Linux/Mac
-
-# 2. Install dependencies
+python3.10 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
+pip install git+https://github.com/myshell-ai/OpenVoice.git   # voice cloning (optional)
 
-# 3. Install ffmpeg (must be on PATH)
-# Windows: winget install ffmpeg
-# Or download from https://ffmpeg.org/download.html
+# ffmpeg must be on PATH
+sudo apt install ffmpeg
 
-# 4. Configure API keys
-cp .env.example .env
-# Edit .env and add your Sarvam & Gemini API keys
+# Wav2Lip (optional): clone the submodule, then download its weights
+git submodule update --init --recursive
+python setup_wav2lip.py
+
+cp .env.example .env    # add SARVAM_API_KEY, GCP_API_KEY, APP_PASSWORD
 ```
 
 ## Usage
 
-### GUI (recommended for most users)
-
 ```bash
-streamlit run app.py
+streamlit run app.py                       # web app (password = APP_PASSWORD)
+./start_ngrok.sh                           # … exposed through ngrok
+python main.py input/lecture.mp4 --langs hi te
+python main.py input/lecture.mp4 --stt whisper --translate gcp --no-tts
 ```
 
-This opens a web interface where you can upload a video, pick languages, and download results.
+In the web app, "Past Results" lists the jobs started from your browser (the key is in
+the page URL — bookmark it) plus shared examples from before per-user keys existed.
 
-### CLI
+### Scheduling settings (`config/settings.py`)
 
-```bash
-python main.py input/lecture.mp4
-python main.py input/lecture.mp4 --stt gemini --translate sarvam --no-tts
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `MAX_CONCURRENT_JOBS` | 2 | jobs whose stages run at the same time |
+| `MAX_WAITING_JOBS` | 1 | further jobs allowed to queue; beyond that the app reports "server busy" |
+| `DAG_GPU_SLOTS` | 1 | GPU stages at once (4 GB card) |
+| `DAG_CPU_SLOTS` | half the cores | ffmpeg / alignment stages at once |
+| `DAG_API_SLOTS` | 4 | Sarvam / Google stages at once |
+
+Whisper and OpenVoice run in child processes: CTranslate2 never returns the GPU memory
+it used, which would starve the next GPU stage.
+
+## Project structure
+
 ```
-
-## Project Structure
-
+config/settings.py          API keys, engines, languages, scheduling limits
+src/pipeline.py             run_pipeline(): builds and runs a job's DAG; cache helpers
+src/pipeline_dag.py         the stages of a job and their resources
+src/dag_executor.py         resource-slot scheduler shared by all jobs
+src/job_queue.py            job queue for the web app
+src/transcriber.py          speech-to-text (Whisper / Sarvam)
+src/translator.py           translation (Sarvam / Google)
+src/tts_generator.py        text-to-speech (Sarvam / Google Neural2 / XTTS)
+src/voice_converter.py      OpenVoice voice cloning
+src/audio_aligner.py        timing alignment
+src/audio_separator.py      Demucs separation and music remix
+src/voice_analyzer.py       lecturer pitch / gender, pitch matching
+src/subtitle_generator.py   .srt / .vtt
+src/video_muxer.py          MKV muxing and previews
+src/lip_sync.py             Wav2Lip
+app.py                      Streamlit web app
+main.py                     CLI
+tests/                      pytest suite (python -m pytest)
 ```
-BTP/
-├── config/
-│   └── settings.py            # API keys, language configs, paths
-├── src/
-│   ├── pipeline.py            # Main orchestrator
-│   ├── audio_extractor.py     # ffmpeg audio extraction
-│   ├── transcriber.py         # English STT (Sarvam / Gemini)
-│   ├── translator.py          # Text translation (Sarvam / Gemini)
-│   ├── subtitle_generator.py  # .srt generation with timestamps
-│   └── tts_generator.py       # Text-to-Speech (Sarvam)
-├── app.py                     # Streamlit GUI
-├── input/                     # Place lecture videos here
-├── output/                    # Generated subtitles + audio
-├── main.py                    # CLI entry point
-├── requirements.txt
-└── .env                       # API keys (not committed)
-```
-
-## APIs Used
-
-| API | Purpose |
-|-----|---------|
-| **Sarvam AI** | STT, Translation, TTS for Indian languages |
-| **Google Gemini** | Fallback/alternative for STT & Translation |
 
 ## Languages
 

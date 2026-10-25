@@ -36,9 +36,12 @@ Override the path with the OPENVOICE_CKPT_DIR environment variable.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
 
 logger = logging.getLogger("nptel_pipeline")
@@ -153,6 +156,11 @@ NO_GPU_MESSAGE = "GPU not available — voice cloning is not possible; using the
 def is_gpu_available() -> bool:
     """Return True if a CUDA GPU is available for voice cloning."""
     return _autodetect_device() == "cuda"
+
+
+def _openvoice_work_dir(output_dir: str) -> str:
+    """Scratch directory for OpenVoice's split audio, inside *output_dir*."""
+    return os.path.join(output_dir or ".", "_openvoice_tmp")
 
 
 def _get_audio_duration(path: str) -> float:
@@ -364,12 +372,15 @@ def convert_voice(
     from openvoice import se_extractor
 
     converter = _get_converter(device=device)
+    # se_extractor writes its split audio under target_dir (default: a
+    # "processed/" folder in the current directory) — keep it with the job
+    work_dir = _openvoice_work_dir(os.path.dirname(output_path))
 
     # Target embedding: cached per reference path (expensive to compute)
     if reference_audio_path not in _target_se_cache:
         logger.info("Extracting target speaker embedding from reference clip…")
         target_se, _ = se_extractor.get_se(
-            reference_audio_path, converter, vad=True,
+            reference_audio_path, converter, target_dir=work_dir, vad=True,
         )
         _target_se_cache[reference_audio_path] = target_se
         logger.info("Target embedding cached (%.0f-dim)", target_se.shape[-1])
@@ -378,7 +389,7 @@ def convert_voice(
     # Source embedding: extracted fresh from each TTS segment
     logger.debug("Extracting source embedding from TTS audio…")
     source_se, _ = se_extractor.get_se(
-        tts_audio_path, converter, vad=False,
+        tts_audio_path, converter, target_dir=work_dir, vad=False,
     )
 
     # Convert
@@ -548,6 +559,8 @@ def convert_segments_batch(
         if (idx + 1) % 20 == 0:
             logger.info("[OpenVoice] Converted %d/%d segments", idx + 1, total)
 
+    shutil.rmtree(_openvoice_work_dir(output_dir), ignore_errors=True)
+
     if failed:
         logger.warning("[OpenVoice] %d/%d segments fell back to TTS-only", failed, total)
     else:
@@ -579,78 +592,49 @@ def convert_segments_batch(
     return converted
 
 
-# ─── Full-track batch conversion ──────────────────────────────────────────────
-
-def convert_all_tracks(
-    aligned_audio: dict[str, str],
-    source_audio_path: str,
+def convert_segments_batch_in_subprocess(
+    segment_files: dict[int, str],
+    reference_audio_path: str,
     output_dir: str,
-    video_name: str,
-    device: str | None = None,
-    reference_start_sec: float = 10.0,
-    reference_duration_sec: float = 10.0,
-) -> dict[str, str]:
+) -> dict[int, str]:
     """
-    Apply voice conversion to every aligned language audio track.
+    convert_segments_batch() on the GPU, in a child process.
 
-    Extracts a single reference clip from the original lecture, then calls
-    ``convert_voice()`` for each ``lang_code`` in ``aligned_audio``.
-
-    On per-language failure, falls back gracefully to the un-converted aligned
-    audio rather than crashing the entire pipeline.
-
-    Returns:
-        Dict mapping lang_code → converted audio path (or original if failed).
+    OpenVoice's speaker-embedding step loads faster-whisper ("medium") on the
+    GPU and keeps it in a module global; CTranslate2 never hands that memory
+    back (2.1 GB of a 4 GB card stayed allocated, measured), which starves
+    the GPU stages that run as their own processes (Demucs, Wav2Lip).  A
+    child process releases all of it when it exits.
     """
-    if device is None:
-        device = _autodetect_device()
+    from config.settings import BASE_DIR
 
-    # Extract reference clip once for all languages
-    ref_path = os.path.join(output_dir, f"{video_name}_reference_clip.wav")
-    extract_reference_clip(
-        source_audio_path, ref_path,
-        start_sec=reference_start_sec,
-        duration_sec=reference_duration_sec,
-    )
-
-    converted: dict[str, str] = {}
-    for lang_code, aligned_path in aligned_audio.items():
-        out_path = os.path.join(
-            output_dir, f"{video_name}_{lang_code}_voiced.wav"
+    with tempfile.TemporaryDirectory(prefix="openvoice_") as tmp:
+        request = os.path.join(tmp, "request.json")
+        result = os.path.join(tmp, "result.json")
+        with open(request, "w", encoding="utf-8") as f:
+            json.dump({"segment_files": segment_files, "reference": reference_audio_path,
+                       "output_dir": output_dir}, f)
+        proc = subprocess.run(
+            [sys.executable, "-m", "src.voice_converter", request, result], cwd=BASE_DIR,
         )
-        try:
-            convert_voice(
-                tts_audio_path=aligned_path,
-                reference_audio_path=ref_path,
-                output_path=out_path,
-                device=device,
-            )
-            converted[lang_code] = out_path
-        except Exception as exc:
-            logger.warning(
-                "Voice conversion failed for %s (falling back to TTS-only): %s",
-                lang_code, exc,
-            )
-            converted[lang_code] = aligned_path   # graceful fallback
+        if not os.path.isfile(result):
+            raise RuntimeError(f"Voice cloning process failed (exit code {proc.returncode})")
+        with open(result, encoding="utf-8") as f:
+            converted = json.load(f)
+    return {int(idx): path for idx, path in converted.items()}
 
-    # ── GPU cleanup after all tracks are processed ────────────────────
-    global _converter_cache, _target_se_cache
-    try:
-        import torch  # noqa: PLC0415
-        if _converter_cache is not None:
-            # Move converter model to CPU before deleting
-            try:
-                _converter_cache.model.to("cpu")
-            except Exception:
-                pass
-            del _converter_cache
-            _converter_cache = None
-        _target_se_cache.clear()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-            logger.info("[OpenVoice] GPU memory released after voice conversion")
-    except Exception as exc:
-        logger.warning("[OpenVoice] GPU cleanup failed: %s", exc)
 
-    return converted
+if __name__ == "__main__":
+    # Child process for convert_segments_batch_in_subprocess:
+    #   python -m src.voice_converter <request.json> <result.json>
+    from src.utils import setup_logging
+
+    setup_logging()
+    with open(sys.argv[1], encoding="utf-8") as _f:
+        _req = json.load(_f)
+    _converted = convert_segments_batch(
+        {int(k): v for k, v in _req["segment_files"].items()},
+        _req["reference"], _req["output_dir"], device="cuda",
+    )
+    with open(sys.argv[2], "w", encoding="utf-8") as _f:
+        json.dump(_converted, _f)

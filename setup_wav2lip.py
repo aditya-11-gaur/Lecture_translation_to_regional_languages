@@ -16,7 +16,7 @@ What it does
 """
 
 from __future__ import annotations
-import os, sys, urllib.request, hashlib, shutil
+import os, sys
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 WAV2LIP   = os.path.join(REPO_ROOT, "Wav2Lip")
@@ -47,44 +47,31 @@ else:
     print("⚠ Could not find expected line in audio.py — check manually")
 
 # ── 2. Download model weights ───────────────────────────────────────────────
+# Same sources the app uses (src/lip_sync.py): wav2lip_gan.pth from the official
+# Google Drive folder via gdown, s3fd.pth from adrianbulat.com.
 
 MODELS = [
-    {
-        "name":  "wav2lip_gan.pth",
-        "url":   "https://iiitaphyd-my.sharepoint.com/:u:/g/personal/radrabha_m_research_iiit_ac_in/EdjI7bZlgApMqsVoEUUXpLsBxqXbn5z8dvkNr3DTNPkCRg?e=CdW6FH",
-        "dest":  os.path.join(WAV2LIP, "checkpoints", "wav2lip_gan.pth"),
-        "size_mb": 416,
-    },
-    {
-        "name":  "s3fd.pth",
-        "url":   "https://www.adrianbulat.com/downloads/python-fan/s3fd-619a316812.pth",
-        "dest":  os.path.join(WAV2LIP, "face_detection", "detection", "sfd", "s3fd.pth"),
-        "size_mb": 86,
-    },
+    (os.path.join(WAV2LIP, "checkpoints", "wav2lip_gan.pth"), 416),
+    (os.path.join(WAV2LIP, "face_detection", "detection", "sfd", "s3fd.pth"), 86),
 ]
 
-def _download(url: str, dest: str, name: str, expected_mb: int) -> None:
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    if os.path.isfile(dest):
-        actual_mb = os.path.getsize(dest) / (1024 * 1024)
-        if actual_mb > expected_mb * 0.9:
-            print(f"✓ {name} already present ({actual_mb:.0f} MB)")
-            return
-        else:
-            print(f"⚠ {name} exists but looks truncated ({actual_mb:.0f} MB) — re-downloading")
-            os.remove(dest)
-
-    print(f"  Downloading {name} ({expected_mb} MB) … ", end="", flush=True)
-    try:
-        urllib.request.urlretrieve(url, dest)
-        actual_mb = os.path.getsize(dest) / (1024 * 1024)
-        print(f"done ({actual_mb:.0f} MB)")
-    except Exception as exc:
-        print(f"\n  ERROR: {exc}")
-        print(f"  Please download manually:\n    URL: {url}\n    Dest: {dest}")
+# A partial download or an HTML error page would otherwise count as present
+for path, expected_mb in MODELS:
+    if os.path.isfile(path):
+        actual_mb = os.path.getsize(path) / (1024 * 1024)
+        if actual_mb < expected_mb * 0.9:
+            print(f"⚠ {os.path.basename(path)} looks truncated ({actual_mb:.0f} MB) — re-downloading")
+            os.remove(path)
 
 print("\nDownloading model weights (this only runs once):")
-for m in MODELS:
-    _download(m["url"], m["dest"], m["name"], m["size_mb"])
+sys.path.insert(0, REPO_ROOT)
+from src.lip_sync import _ensure_wav2lip_checkpoints  # noqa: E402
+
+try:
+    _ensure_wav2lip_checkpoints(WAV2LIP)
+except RuntimeError as exc:
+    sys.exit(f"ERROR: {exc}")
+for path, _ in MODELS:
+    print(f"✓ {os.path.relpath(path, REPO_ROOT)} ({os.path.getsize(path) / (1024 * 1024):.0f} MB)")
 
 print("\nSetup complete. Run the app with: streamlit run app.py")

@@ -5,13 +5,12 @@ Extract speaker voice characteristics from the original audio
 for voice-preserving TTS synthesis.
 
 Extracts:
-  • Speaking rate (words per second)
   • Average pitch / fundamental frequency (F0)
   • Volume / loudness (dBFS)
   • Pitch range (to detect male vs female speakers)
 
-These characteristics are used to adjust TTS parameters and
-post-process dubbed audio for better speaker consistency.
+The gender picks a matching TTS voice; the pitch drives the post-TTS
+pitch shift (pitch_shift_to_match) towards the original speaker.
 """
 
 from __future__ import annotations
@@ -19,9 +18,8 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -31,7 +29,6 @@ logger = logging.getLogger("nptel_pipeline")
 @dataclass
 class VoiceProfile:
     """Characteristics of the original speaker's voice."""
-    speaking_rate_wps: float = 0.0             # words per second
     avg_pitch_hz: float = 0.0                  # average fundamental frequency
     pitch_range: tuple[float, float] = (0.0, 0.0)  # (min, max) Hz
     avg_volume_dbfs: float = 0.0               # average volume in dBFS
@@ -40,7 +37,6 @@ class VoiceProfile:
 
     def to_dict(self) -> dict:
         return {
-            "speaking_rate_wps": round(self.speaking_rate_wps, 2),
             "avg_pitch_hz": round(self.avg_pitch_hz, 1),
             "pitch_range": (round(self.pitch_range[0], 1), round(self.pitch_range[1], 1)),
             "avg_volume_dbfs": round(self.avg_volume_dbfs, 1),
@@ -48,76 +44,13 @@ class VoiceProfile:
             "duration_seconds": round(self.duration_seconds, 2),
         }
 
-    @property
-    def tts_rate_adjustment(self) -> float:
-        """
-        Suggested TTS rate multiplier to match original speaking speed.
-        Normal speaking rate is ~2.5 words/sec.
-        Returns a value like 1.0 (normal), 1.2 (faster), 0.8 (slower).
-        """
-        NORMAL_WPS = 2.5
-        if self.speaking_rate_wps <= 0:
-            return 1.0
-        ratio = self.speaking_rate_wps / NORMAL_WPS
-        return max(0.7, min(1.5, ratio))
 
-    @property
-    def tts_pitch_adjustment_semitones(self) -> float:
-        """
-        Suggested pitch shift in semitones to apply post-TTS.
-        Based on difference between original speaker pitch and
-        typical TTS voice pitch.
-        """
-        TYPICAL_FEMALE_TTS = 220.0  # Hz
-        TYPICAL_MALE_TTS = 130.0    # Hz
-
-        if self.avg_pitch_hz <= 0:
-            return 0.0
-
-        # Determine which TTS pitch to compare against
-        if self.is_male:
-            ref = TYPICAL_MALE_TTS
-        elif self.is_male is False:
-            ref = TYPICAL_FEMALE_TTS
-        else:
-            ref = 175.0  # midpoint
-
-        if ref <= 0:
-            return 0.0
-        semitones = 12 * math.log2(self.avg_pitch_hz / ref)
-        # Clamp to ±6 semitones (half an octave)
-        return max(-6.0, min(6.0, semitones))
-
-    @property
-    def edge_tts_rate_str(self) -> str:
-        """Rate string for edge-tts SSML (e.g. '+10%', '-5%')."""
-        adj = self.tts_rate_adjustment
-        pct = int((adj - 1.0) * 100)
-        if pct >= 0:
-            return f"+{pct}%"
-        return f"{pct}%"
-
-    @property
-    def edge_tts_pitch_str(self) -> str:
-        """Pitch string for edge-tts SSML (e.g. '+2st', '-3st')."""
-        st = self.tts_pitch_adjustment_semitones
-        # edge-tts uses Hz offset; approximate: 1 semitone ≈ 10 Hz at speech range
-        hz_offset = int(st * 10)
-        if hz_offset >= 0:
-            return f"+{hz_offset}Hz"
-        return f"{hz_offset}Hz"
-
-
-def analyze_voice(
-    audio_path: str,
-    segments=None,
-) -> VoiceProfile:
+def analyze_voice(audio_path: str) -> VoiceProfile:
     """
     Analyze the original audio to build a voice profile.
 
     Args:
-        audio_path: Path to the source audio file (WAV).
-        segments:   Optional transcript segments for word-rate calculation.
+        audio_path: Path to the source audio file (isolated vocals if available).
 
     Returns:
         VoiceProfile with extracted characteristics.
@@ -126,13 +59,6 @@ def analyze_voice(
 
     # Duration
     profile.duration_seconds = _get_duration(audio_path)
-
-    # Speaking rate from segments
-    if segments:
-        total_words = sum(len(s.text.split()) for s in segments)
-        total_speech_time = sum(max(0, s.end - s.start) for s in segments)
-        if total_speech_time > 0:
-            profile.speaking_rate_wps = total_words / total_speech_time
 
     # Volume analysis via ffmpeg
     try:
@@ -153,8 +79,7 @@ def analyze_voice(
         logger.warning("Pitch analysis failed: %s", exc)
 
     logger.info(
-        "Voice profile: rate=%.1f wps, pitch=%.0f Hz (%s), volume=%.1f dBFS",
-        profile.speaking_rate_wps,
+        "Voice profile: pitch=%.0f Hz (%s), volume=%.1f dBFS",
         profile.avg_pitch_hz,
         "male" if profile.is_male else ("female" if profile.is_male is False else "unknown"),
         profile.avg_volume_dbfs,
@@ -311,8 +236,10 @@ def _autocorrelation_pitch(frame, sample_rate: int) -> float:
     return sample_rate / best_lag
 
 
-# Largest post-TTS pitch correction; beyond this, shifting sounds artificial.
-MAX_PITCH_SHIFT_SEMITONES = 6.0
+# Largest post-TTS pitch correction.  The shift moves formants with the pitch
+# (see apply_voice_profile_to_audio), which stays natural for small shifts —
+# and the TTS voice already matches the lecturer's gender.
+MAX_PITCH_SHIFT_SEMITONES = 3.0
 
 
 def pitch_shift_to_match(profile: VoiceProfile, tts_audio_path: str) -> float:
@@ -344,46 +271,30 @@ def apply_voice_profile_to_audio(
 
     Applies a pitch shift (semitones) to match the original speaker's pitch.
     ``semitones`` defaults to ``pitch_shift_to_match(profile, audio_path)``.
+    The output codec follows *output_path*'s extension (.flac / .wav / .mp3).
     """
-    filters: list[str] = []
-
     if semitones is None:
         semitones = pitch_shift_to_match(profile, audio_path)
 
-    # Pitch shift if significant
-    if abs(semitones) > 0.5:
-        # Use rubberband for high-quality pitch shifting
-        pitch_ratio = 2 ** (semitones / 12)
-        filters.append(
-            f"rubberband=pitch={pitch_ratio:.6f}"
-            ":formant=preserved"
-            ":transients=smooth"
-        )
-
-    if not filters:
-        # No processing needed, just copy
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", audio_path, "-c:a", "copy", output_path],
-            capture_output=True, check=True,
-        )
+    # Resample-based shift (pitch and formants move together) + WSOLA tempo
+    # restore.  Measured on lecture dubs, Rubber Band's formant-preserving
+    # shift dropped estimated speech quality (SQUIM PESQ) from 3.5 to 1.3;
+    # this keeps it at 3.5.
+    codec = (["-c:a", "flac"] if output_path.lower().endswith(".flac")
+             else ["-c:a", "pcm_s16le"] if output_path.lower().endswith(".wav")
+             else ["-c:a", "libmp3lame", "-b:a", "192k"])
+    if abs(semitones) <= 0.5:
+        subprocess.run(["ffmpeg", "-y", "-i", audio_path, *codec, output_path],
+                       capture_output=True, check=True)
         return output_path
 
-    filter_str = ",".join(filters)
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", audio_path,
-        "-af", filter_str,
-        output_path,
-    ]
-
-    try:
-        subprocess.run(cmd, capture_output=True, check=True)
-    except subprocess.CalledProcessError:
-        # Fallback: copy without voice adjustments
-        logger.warning("Voice profile pitch shift failed, copying as-is")
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", audio_path, "-c:a", "copy", output_path],
-            capture_output=True, check=True,
-        )
-
+    sr = int(subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=sample_rate", "-of", "csv=p=0", audio_path],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip())
+    ratio = 2 ** (semitones / 12)
+    af = f"asetrate={sr * ratio:.3f},aresample={sr},atempo={1 / ratio:.6f}"
+    subprocess.run(["ffmpeg", "-y", "-i", audio_path, "-af", af, *codec, output_path],
+                   capture_output=True, check=True)
     return output_path

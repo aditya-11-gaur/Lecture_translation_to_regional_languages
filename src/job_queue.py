@@ -1,15 +1,18 @@
 """
 job_queue.py
 ────────────
-Global single-GPU job queue for multi-user Streamlit deployments.
+Global job queue for multi-user Streamlit deployments.
 
 Design
 ──────
-• One pipeline job runs at a time (GPU is a shared, non-divisible resource).
 • Incoming jobs are placed in a FIFO queue and assigned a UUID.
-• A single background daemon thread dequeues and runs jobs sequentially.
+• MAX_CONCURRENT_JOBS worker threads take jobs from the queue.  Each job is a
+  DAG of stages; the shared DAG executor decides which stages run, so two
+  active jobs share the GPU / CPU / API slots instead of waiting in line
+  (the GPU itself still runs one stage at a time).
+• A job name can only belong to one active job at a time, so two uploads
+  with the same name can't overwrite each other's video or outputs.
 • Each session polls its job's status via `get_job_status(job_id)`.
-• Streamlit sessions submit via `submit_job()` and poll via `get_job_status()`.
 
 Thread safety
 ─────────────
@@ -39,11 +42,16 @@ FAILED   = "failed"     # raised an exception
 CANCELED = "canceled"   # removed before starting (future use)
 
 
+class JobNameInUse(RuntimeError):
+    """Another pending/running job already has this name."""
+
+
 @dataclass
 class Job:
     job_id:       str
     fn:           Callable       # callable that runs the pipeline
     kwargs:       dict           # kwargs forwarded to fn
+    name:         str | None     = None
     submitted_at: datetime       = field(default_factory=datetime.now)
     started_at:   datetime | None = None
     finished_at:  datetime | None = None
@@ -58,7 +66,7 @@ class Job:
 _lock:  threading.Lock      = threading.Lock()
 _queue: queue.Queue[str]    = queue.Queue()   # holds job_ids in FIFO order
 _jobs:  dict[str, Job]      = {}              # job_id → Job
-_worker_started: bool       = False
+_workers_started: bool      = False
 
 
 # ── Worker thread ─────────────────────────────────────────────────────────────
@@ -106,23 +114,28 @@ def _worker() -> None:
 
 
 def _ensure_worker() -> None:
-    """Start the background worker thread if it hasn't been started yet."""
-    global _worker_started
-    if not _worker_started:
-        t = threading.Thread(target=_worker, daemon=True, name="pipeline-worker")
-        t.start()
-        _worker_started = True
+    """Start the background worker threads if they haven't been started yet."""
+    global _workers_started
+    with _lock:
+        if _workers_started:
+            return
+        from config.settings import MAX_CONCURRENT_JOBS
+        for i in range(MAX_CONCURRENT_JOBS):
+            threading.Thread(target=_worker, daemon=True, name=f"pipeline-worker-{i}").start()
+        _workers_started = True
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def submit_job(fn: Callable, **kwargs) -> str:
+def submit_job(fn: Callable, *, name: str | None = None, **kwargs) -> str:
     """
     Submit a job to the queue.
 
     Parameters
     ----------
     fn      : callable with signature fn(progress=..., **kwargs) → result
+    name    : optional job name; raises JobNameInUse if a pending or running
+              job already has it
     **kwargs: forwarded to fn (everything except `progress`)
 
     Returns
@@ -131,8 +144,12 @@ def submit_job(fn: Callable, **kwargs) -> str:
     """
     _ensure_worker()
     job_id = uuid.uuid4().hex
-    job    = Job(job_id=job_id, fn=fn, kwargs=kwargs)
+    job    = Job(job_id=job_id, fn=fn, kwargs=kwargs, name=name)
     with _lock:
+        if name is not None and any(
+            j.name == name and j.status in (PENDING, RUNNING) for j in _jobs.values()
+        ):
+            raise JobNameInUse(name)
         _jobs[job_id] = job
         _queue.put(job_id)
     logger.info("[JobQueue] Submitted job %s (queue depth: %d)",
@@ -179,6 +196,12 @@ def get_job_status(job_id: str) -> dict:
         "error":          job.error,
         "elapsed_s":      elapsed,
     }
+
+
+def is_name_active(name: str) -> bool:
+    """True if a pending or running job has this name."""
+    with _lock:
+        return any(j.name == name and j.status in (PENDING, RUNNING) for j in _jobs.values())
 
 
 def queue_depth() -> int:

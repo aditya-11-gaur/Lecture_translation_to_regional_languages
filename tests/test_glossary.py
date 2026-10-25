@@ -60,16 +60,6 @@ class TestGlossaryDataclass:
         found = glossary.find_terms_in_text("")
         assert found == []
 
-    def test_build_translation_prompt_section(self, glossary):
-        terms = ["algorithm", "data structure"]
-        section = glossary.build_translation_prompt_section(terms)
-        assert "algorithm" in section.lower()
-
-    def test_build_prompt_section_none(self, glossary):
-        section = glossary.build_translation_prompt_section(None)
-        # With None terms, uses all glossary terms — result is non-empty
-        assert isinstance(section, str)
-
     def test_extract_terms_from_segments(self, glossary):
         from src.transcriber import Segment
         segments = [

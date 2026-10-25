@@ -4,8 +4,8 @@ transcriber.py
 Speech-to-Text: transcribe the English audio and produce timestamped segments.
 
 Supports two backends:
+  • Whisper (local, word-level timestamps)
   • Sarvam STT API
-  • Gemini (multimodal audio → text with timestamps)
 
 Output format – list of segments:
   [
@@ -20,13 +20,12 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 
 import requests
-from google import genai
-from google.genai import types
-from config.settings import SARVAM_API_KEY, SARVAM_BASE_URL, GEMINI_API_KEY
+from config.settings import SARVAM_API_KEY, SARVAM_BASE_URL
 from src.filler_detector import (
     detect_fillers_in_words,
     FillerInfo,
@@ -84,7 +83,7 @@ def _split_at_sentence_boundaries(segments: list[Segment]) -> list[Segment]:
     """
     Atomise segments at internal sentence boundaries.
 
-    A Whisper or Gemini segment often contains MORE than one sentence:
+    A Whisper or Sarvam segment often contains MORE than one sentence:
         "Hello everyone. My name is Amit"  <- two sentences in one segment
 
     This function splits such segments so every output segment holds
@@ -133,8 +132,9 @@ def _words_to_sentence_chunks(
         1. Current chunk duration >= MIN_CHUNK_DUR  (long enough to be useful)
         2. The current word ends a sentence  (., !, ?)
 
-    Hard-flush at MAX_CHUNK_DUR even mid-sentence (at a word boundary) so
-    no chunk ever becomes so long that TTS/alignment breaks.
+    At MAX_CHUNK_DUR without a sentence end, split at the longest pause
+    between words (a comma pause preferred) rather than at the word reached,
+    so the translator gets whole clauses instead of a sentence cut mid-phrase.
 
     Result: chunks that are all roughly the same length (MIN–MAX range),
     always end at a sentence boundary, and use exact Whisper word timestamps
@@ -154,16 +154,31 @@ def _words_to_sentence_chunks(
     ch_st:    list[float] = []
     ch_et:    list[float] = []
 
-    def _flush():
-        if not ch_words:
+    def _flush(n: int | None = None):
+        """Emit the first *n* buffered words (all by default) as a segment."""
+        n = len(ch_words) if n is None else n
+        if not n:
             return
         result.append(Segment(
             start=round(ch_st[0], 3),
-            end=round(ch_et[-1], 3),
-            text=" ".join(ch_words),
-            fillers=detect_fillers_in_words(ch_words, ch_st, ch_et),
+            end=round(ch_et[n - 1], 3),
+            text=" ".join(ch_words[:n]),
+            fillers=detect_fillers_in_words(ch_words[:n], ch_st[:n], ch_et[:n]),
         ))
-        ch_words.clear(); ch_st.clear(); ch_et.clear()
+        del ch_words[:n], ch_st[:n], ch_et[:n]
+
+    def _best_split() -> int:
+        """Word count to emit when over MAX_CHUNK_DUR: cut at the longest pause."""
+        best, best_score = len(ch_words), -1.0
+        for k in range(len(ch_words) - 1):
+            if ch_et[k] - ch_st[0] < 2.0:          # avoid a tiny first piece
+                continue
+            score = ch_st[k + 1] - ch_et[k]        # pause after word k
+            if ch_words[k][-1:] in ",;:":
+                score += 0.3
+            if score > best_score:
+                best, best_score = k + 1, score
+        return best
 
     for word, t_start, t_end in words:
         w = word.strip()
@@ -178,8 +193,8 @@ def _words_to_sentence_chunks(
         ends_sentence = w.rstrip()[-1] in _SENT_END if w.rstrip() else False
 
         if chunk_dur >= MAX_CHUNK_DUR:
-            # Hard cap: flush now regardless of sentence boundary
-            _flush()
+            # Hard cap: no sentence end in time — cut at the longest pause
+            _flush(_best_split())
         elif ends_sentence and chunk_dur >= MIN_CHUNK_DUR:
             # Good flush point: sentence ended and chunk is long enough
             _flush()
@@ -202,10 +217,10 @@ def _merge_into_sentence_chunks(
     target_sentences: int = 3,    # kept for API compat, ignored internally
 ) -> list[Segment]:
     """
-    Duration-balanced sentence-aligned chunker for Gemini / Sarvam output.
+    Duration-balanced sentence-aligned chunker for Sarvam output.
 
     Same philosophy as _words_to_sentence_chunks but operates on segments
-    (not words) since Gemini/Sarvam don't give word-level timestamps.
+    (not words) since Sarvam doesn't give word-level timestamps.
 
     Stage 1: split any multi-sentence segment into sentence atoms.
     Stage 2: merge atoms into chunks of MIN_CHUNK_DUR–MAX_CHUNK_DUR,
@@ -453,13 +468,13 @@ def split_segments_at_silences(
     return result
 
 
-def transcribe_audio(audio_path: str, method: str = "gemini") -> list[Segment]:
+def transcribe_audio(audio_path: str, method: str = "whisper") -> list[Segment]:
     """
     Transcribe an audio file and return timestamped segments.
 
     Args:
         audio_path: Path to the WAV audio file.
-        method:     "whisper", "sarvam", or "gemini".
+        method:     "whisper" or "sarvam".
 
     Returns:
         List of Segment objects with start/end times and English text.
@@ -470,11 +485,9 @@ def transcribe_audio(audio_path: str, method: str = "gemini") -> list[Segment]:
         return _transcribe_whisper(audio_path)
     elif method == "sarvam":
         raw = _transcribe_sarvam(audio_path)
-    elif method == "gemini":
-        raw = _transcribe_gemini(audio_path)
     else:
         raise ValueError(f"Unknown transcription method: {method}")
-    # For Sarvam/Gemini: two-stage split+merge to fix sentence boundaries
+    # For Sarvam: two-stage split+merge to fix sentence boundaries
     return _merge_into_sentence_chunks(raw)
 
 
@@ -482,7 +495,36 @@ def transcribe_audio(audio_path: str, method: str = "gemini") -> list[Segment]:
 
 def _transcribe_whisper(audio_path: str) -> list[Segment]:
     """
-    Transcribe audio using faster-whisper running locally.
+    Transcribe with faster-whisper in a child process.
+
+    CTranslate2 keeps the VRAM it used after the Whisper model is deleted
+    (3.7 GB of a 4 GB card, measured), which leaves too little for the next
+    GPU stage: Demucs and Wav2Lip run as their own processes and hit CUDA
+    out-of-memory.  A child process gives all of it back when it exits.
+    """
+    from config.settings import BASE_DIR
+
+    with tempfile.TemporaryDirectory(prefix="whisper_") as tmp:
+        out_json = os.path.join(tmp, "segments.json")
+        proc = subprocess.run(
+            [sys.executable, "-m", "src.transcriber", audio_path, out_json],
+            cwd=BASE_DIR,
+        )
+        if not os.path.isfile(out_json):
+            raise RuntimeError(f"Whisper process failed (exit code {proc.returncode})")
+        with open(out_json, encoding="utf-8") as f:
+            payload = json.load(f)
+
+    if "error" in payload:
+        # ValueError carries "no speech detected", which triggers the Demucs retry
+        error_cls = ValueError if payload["error_type"] == "ValueError" else RuntimeError
+        raise error_cls(payload["error"])
+    return [Segment.from_dict(d) for d in payload["segments"]]
+
+
+def _transcribe_whisper_local(audio_path: str) -> list[Segment]:
+    """
+    Transcribe audio using faster-whisper running in this process.
 
     This produces highly accurate word-level timestamps by using the
     Whisper model's cross-attention alignment — far more reliable than
@@ -733,80 +775,6 @@ def _sanitize_timestamps(segments: list[Segment]) -> list[Segment]:
     return cleaned
 
 
-def _get_audio_duration(audio_path: str) -> float:
-    """Get the duration of an audio file in seconds via ffprobe."""
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "json",
-        audio_path,
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        info = json.loads(result.stdout)
-        return float(info["format"]["duration"])
-    except Exception:
-        return 0.0
-
-
-def _auto_rescale_timestamps(
-    segments: list[Segment], audio_path: str,
-) -> list[Segment]:
-    """
-    Detect and correct if Gemini returned timestamps in minutes (or other
-    wrong unit) instead of seconds.
-
-    Heuristic:
-      1. Get the actual audio duration in seconds.
-      2. Find the span of the returned timestamps (last_end).
-      3. If last_end < duration * 0.15 (timestamps cover <15% of audio),
-         try common multipliers (60, 100, 10) and pick whichever brings
-         the coverage closest to the actual audio duration.
-    """
-    audio_dur = _get_audio_duration(audio_path)
-    if audio_dur <= 0 or not segments:
-        return segments
-
-    last_end = max(s.end for s in segments)
-    first_start = min(s.start for s in segments)
-    span = last_end - first_start
-
-    # If timestamps already cover at least 15% of the audio, assume they're fine
-    if span >= audio_dur * 0.15:
-        logger.debug("Timestamps look correct (span=%.1fs vs audio=%.1fs)",
-                     span, audio_dur)
-        return segments
-
-    # Try common multipliers
-    best_factor = 1
-    best_diff = abs(last_end - audio_dur)
-    for factor in [60, 100, 10]:
-        scaled_end = last_end * factor
-        diff = abs(scaled_end - audio_dur)
-        if diff < best_diff:
-            best_diff = diff
-            best_factor = factor
-
-    if best_factor == 1:
-        logger.warning("Timestamps look too short (span=%.1fs vs audio=%.1fs) "
-                       "but no rescale factor improved them", span, audio_dur)
-        return segments
-
-    unit_name = {60: "minutes", 100: "centiseconds (/100)", 10: "deciseconds"}
-    logger.warning("Auto-rescaling timestamps ×%d (detected %s instead of seconds; "
-                   "span was %.2f, audio is %.1fs)",
-                   best_factor, unit_name.get(best_factor, 'unknown'), span, audio_dur)
-
-    rescaled = []
-    for seg in segments:
-        rescaled.append(Segment(
-            start=seg.start * best_factor,
-            end=seg.end * best_factor,
-            text=seg.text,
-        ))
-    return rescaled
-
-
 def _group_words_into_segments(
     words: list[str],
     start_times: list[float],
@@ -854,101 +822,15 @@ def _group_words_into_segments(
     return segments
 
 
-# ── Gemini STT ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    # Child process for _transcribe_whisper:  python -m src.transcriber <audio> <out.json>
+    from src.utils import setup_logging
 
-def _transcribe_gemini(audio_path: str) -> list[Segment]:
-    """
-    Use Gemini multimodal to transcribe audio with timestamps.
-    Uploads the audio file, prompts Gemini for a JSON transcript,
-    and parses the response into Segment objects.
-    """
-    logger.info("Gemini STT → %s", audio_path)
-
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY is not set in .env")
-
-    client = genai.Client(api_key=GEMINI_API_KEY)
-
-    logger.info("Uploading audio to Gemini…")
-    audio_file = client.files.upload(file=audio_path)
-    logger.info("Uploaded: %s", audio_file.name)
-
-    # Prompt – ask for timestamped JSON
-    prompt = """You are a precise transcription engine with frame-accurate timestamps.
-Transcribe the following English audio with EXACT timestamps matching when
-each phrase is actually spoken.
-
-Return ONLY a valid JSON array (no markdown, no code fences) where each element is:
-{"start": <seconds as float>, "end": <seconds as float>, "text": "<transcribed text>"}
-
-CRITICAL RULES FOR TIMESTAMPS:
-- ALL timestamps MUST be in SECONDS (not minutes, not milliseconds).
-  For example, if a phrase starts at 1 minute 23.5 seconds, write 83.5 (NOT 1.39).
-- "start" = the EXACT second the first word of the segment begins being spoken.
-- "end"   = the EXACT second the last word of the segment finishes being spoken.
-- Each segment should be ONE sentence or a natural clause (roughly 3-10 seconds).
-- Timestamps must be in seconds with at least 1 decimal place (e.g. 12.5, not 12).
-- For a 2-minute audio, the last segment's end should be around 120, NOT around 2.0.
-- Timestamps MUST be strictly monotonically increasing (no overlaps).
-- "start" of segment N+1 must be >= "end" of segment N.
-- Do NOT round timestamps to whole seconds; be as precise as possible.
-- The first segment's "start" must match when speech actually begins (not 0.0 if there is leading silence).
-- The last segment's "end" must match when the last word finishes (not the total audio length).
-- Transcribe ALL spoken words verbatim. Do not summarize or paraphrase.
-- Do NOT merge long passages into one segment; split at sentence boundaries.
-- Return ONLY the JSON array, nothing else."""
-
-    logger.info("Requesting transcription from Gemini…")
-    response = client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=[prompt, audio_file],
-        config=types.GenerateContentConfig(
-            temperature=0.1,
-            response_mime_type="application/json",
-        ),
-    )
-
-    raw_text = response.text.strip()
-    logger.info("Got response (%d chars)", len(raw_text))
-
-    # Parse JSON – handle possible markdown code fences
-    json_text = raw_text
-    if json_text.startswith("```"):
-        json_text = re.sub(r"^```(?:json)?\s*", "", json_text)
-        json_text = re.sub(r"\s*```$", "", json_text)
-
+    setup_logging()
+    _audio, _out = sys.argv[1], sys.argv[2]
     try:
-        data = json.loads(json_text)
-    except json.JSONDecodeError as e:
-        logger.error("Failed to parse Gemini JSON: %s", e)
-        logger.debug("Raw response:\n%s", raw_text[:500])
-        raise ValueError(f"Gemini returned invalid JSON: {e}")
-
-    if not isinstance(data, list):
-        raise ValueError(f"Expected a JSON array, got {type(data).__name__}")
-
-    segments: list[Segment] = []
-    for item in data:
-        start = float(item.get("start", 0))
-        end = float(item.get("end", start + 5))
-        text = str(item.get("text", "")).strip()
-        if text:
-            segments.append(Segment(start=start, end=end, text=text))
-
-    if not segments:
-        raise ValueError("Gemini returned an empty transcript")
-
-    logger.info("Parsed %d segments", len(segments))
-
-    # Clean up uploaded file
-    try:
-        client.files.delete(name=audio_file.name)
-    except Exception:
-        pass
-
-    # Auto-detect and fix wrong time units (Gemini sometimes returns minutes)
-    segments = _auto_rescale_timestamps(segments, audio_path)
-
-    # Sanitize timestamps (Gemini can produce overlaps / non-monotonic times)
-    segments = _sanitize_timestamps(segments)
-    return segments
+        _payload = {"segments": [s.to_dict() for s in _transcribe_whisper_local(_audio)]}
+    except Exception as _exc:
+        _payload = {"error": str(_exc), "error_type": type(_exc).__name__}
+    with open(_out, "w", encoding="utf-8") as _f:
+        json.dump(_payload, _f, ensure_ascii=False)

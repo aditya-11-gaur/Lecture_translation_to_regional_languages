@@ -13,20 +13,6 @@ from src.glossary import load_default_glossary
 class TestTranslateSegmentsDispatch:
     """Test translate_segments routes to the right engine."""
 
-    @patch("src.translator._translate_batch_gemini")
-    def test_dispatches_to_gemini(self, mock_gemini, sample_segments):
-        from src.translator import translate_segments
-
-        mock_gemini.return_value = [
-            Segment(start=s.start, end=s.end, text=f"[HI]{s.text}")
-            for s in sample_segments
-        ]
-        result = translate_segments(
-            sample_segments, target_langs=["hi"], method="gemini"
-        )
-        assert "hi" in result
-        assert len(result["hi"]) == len(sample_segments)
-
     @patch("src.translator._translate_batch_sarvam")
     def test_dispatches_to_sarvam(self, mock_sarvam, sample_segments):
         from src.translator import translate_segments
@@ -57,30 +43,20 @@ class TestCodeMixingIntegration:
         sig = inspect.signature(translate_segments)
         assert "glossary" in sig.parameters
 
-    def test_glossary_prompt_section(self):
-        """Glossary builds a non-empty prompt section for known terms."""
-        glossary = load_default_glossary()
-        terms = glossary.find_terms_in_text(
-            "Let us discuss the algorithm and its time complexity."
-        )
-        if terms:
-            section = glossary.build_translation_prompt_section(terms)
-            assert len(section) > 0
-
 
 class TestTranslatorPreservesTimestamps:
     """Translated segments should retain original timestamps."""
 
-    @patch("src.translator._translate_batch_gemini")
-    def test_timestamps_preserved(self, mock_gemini, sample_segments):
+    @patch("src.translator._translate_batch_sarvam")
+    def test_timestamps_preserved(self, mock_sarvam, sample_segments):
         from src.translator import translate_segments
 
-        mock_gemini.return_value = [
+        mock_sarvam.return_value = [
             Segment(start=s.start, end=s.end, text=f"translated: {s.text}")
             for s in sample_segments
         ]
         result = translate_segments(
-            sample_segments, target_langs=["hi"], method="gemini"
+            sample_segments, target_langs=["hi"], method="sarvam"
         )
         for orig, trans in zip(sample_segments, result["hi"]):
             assert trans.start == orig.start

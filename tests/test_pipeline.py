@@ -131,22 +131,12 @@ class TestPipelineSignature:
 
 
 class TestPipelinePreflightIntegration:
-    """Test that preflight checks are invoked."""
+    """Preflight checks run before any stage."""
 
-    @patch("src.pipeline.file_sha256", return_value="0" * 64)
-    @patch("src.pipeline.run_preflight_checks")
-    @patch("src.pipeline.extract_audio", return_value="fake_audio.wav")
-    @patch("src.pipeline.transcribe_audio", return_value=[])
-    @patch("src.pipeline.translate_segments", return_value={})
-    @patch("src.pipeline.generate_all_subtitles", return_value={})
-    @patch("src.pipeline._get_media_duration", return_value=60.0)
-    @patch("src.pipeline.ENABLE_CODE_MIXING", False)
-    @patch("src.pipeline.ENABLE_VOICE_PRESERVATION", False)
-    def test_preflight_called(
-        self, mock_dur, mock_subs, mock_trans, mock_stt, mock_extract, mock_preflight,
-        mock_sha,
-    ):
+    @patch("src.pipeline.run_preflight_checks", side_effect=RuntimeError("preflight failed"))
+    def test_preflight_runs_first(self, mock_preflight, tmp_output_dir):
         from src.pipeline import run_pipeline
 
-        run_pipeline("fake_video.mp4", do_tts=False)
+        with pytest.raises(RuntimeError, match="preflight failed"):
+            run_pipeline("fake_video.mp4", output_dir=tmp_output_dir, do_tts=False)
         mock_preflight.assert_called_once()

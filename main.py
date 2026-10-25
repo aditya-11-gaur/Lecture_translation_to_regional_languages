@@ -8,7 +8,7 @@ Usage:
 
 Example:
     python main.py input/lecture.mp4
-    python main.py input/lecture.mp4 --stt gemini --translate gemini --no-tts
+    python main.py input/lecture.mp4 --stt whisper --translate gcp --no-tts
 """
 
 import argparse
@@ -32,13 +32,13 @@ def main():
     parser.add_argument("video", help="Path to the input video file")
     parser.add_argument(
         "--stt",
-        choices=list(ENGINE_REGISTRY.keys()),
+        choices=[e for e, info in ENGINE_REGISTRY.items() if "stt" in info["capabilities"]],
         default=get_default_engine("stt"),
         help=f"Speech-to-Text backend (default: {get_default_engine('stt')}). Available: {', '.join(available) or 'none – add an API key!'}",
     )
     parser.add_argument(
         "--translate",
-        choices=list(ENGINE_REGISTRY.keys()),
+        choices=[e for e, info in ENGINE_REGISTRY.items() if "translate" in info["capabilities"]],
         default=get_default_engine("translate"),
         help=f"Translation backend (default: {get_default_engine('translate')}). Available: {', '.join(available) or 'none'}",
     )

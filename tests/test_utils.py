@@ -14,8 +14,6 @@ from src.utils import (
     PreflightError,
     check_ffmpeg,
     check_ffprobe,
-    check_rubberband,
-    is_rubberband_available,
 )
 
 
@@ -101,28 +99,3 @@ class TestPreflightChecks:
     @patch("shutil.which", return_value=None)
     def test_check_ffprobe_missing(self, mock_which):
         assert check_ffprobe() is False
-
-    @patch("subprocess.run")
-    def test_check_rubberband_available(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="rubberband")
-        assert check_rubberband() is True
-
-    @patch("subprocess.run", side_effect=FileNotFoundError)
-    def test_check_rubberband_missing(self, mock_run):
-        assert check_rubberband() is False
-
-
-class TestIsRubberbandAvailable:
-    """Test the cached rubberband availability check."""
-
-    @patch("src.utils.check_rubberband", return_value=True)
-    def test_rubberband_detected(self, mock_check):
-        import src.utils
-        src.utils._rubberband_available = None  # reset cache
-        assert is_rubberband_available() is True
-
-    @patch("src.utils.check_rubberband", return_value=False)
-    def test_rubberband_not_found(self, mock_check):
-        import src.utils
-        src.utils._rubberband_available = None  # reset cache
-        assert is_rubberband_available() is False

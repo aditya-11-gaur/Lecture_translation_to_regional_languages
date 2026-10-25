@@ -6,7 +6,7 @@ track, using Praat via Parselmouth.
 
 Design notes
 ────────────
-After Rubber Band time-stretching, each dubbed segment has (approximately)
+After time-stretching, each dubbed segment has (approximately)
 the same duration as its English counterpart.  We therefore operate on the
 *full* aligned audio files, which are already duration-matched.
 
@@ -62,7 +62,7 @@ def apply_prosody_transfer(
     Args:
         source_audio_path:  Original English audio (any format; converted
                             internally to WAV for Praat).
-        target_audio_path:  Dubbed audio after Rubber Band alignment (any
+        target_audio_path:  Dubbed audio after alignment (any
                             format).
         output_audio_path:  Destination path for the prosody-transferred
                             audio.  Format is inferred from the extension.

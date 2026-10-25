@@ -4,8 +4,8 @@ translator.py
 Translate English transcript segments into target languages (Hindi, Telugu, Odia).
 
 Supports two backends:
-  • Sarvam Translate API
-  • Gemini (batch translation per language)
+  • Sarvam Translate API (code-mixed mode by default)
+  • Google Cloud Translation v2
 
 Input:  list of Segment objects (English)
 Output: dict  { "hi": [Segment, ...], "te": [...], "od": [...] }
@@ -18,13 +18,10 @@ import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from google import genai
-from google.genai import types
 import requests
 from config.settings import (
     SARVAM_API_KEY,
     SARVAM_BASE_URL,
-    GEMINI_API_KEY,
     GCP_API_KEY,
     TARGET_LANGUAGES,
     ENABLE_CODE_MIXING,
@@ -70,14 +67,10 @@ def _estimate_duration_ratio(
 
 
 
-# ── Maximum segments per Gemini batch call ────────────────────────────────────
-_BATCH_SIZE = 40  # keep well within token limits
-
-
 def translate_segments(
     segments: list[Segment],
     target_langs: list[str] | None = None,
-    method: str = "gemini",
+    method: str = "sarvam",
     glossary: Glossary | None = None,
 ) -> dict[str, list[Segment]]:
     """
@@ -86,7 +79,7 @@ def translate_segments(
     Args:
         segments:     English transcript segments.
         target_langs: Language codes to translate into (default: all targets).
-        method:       "sarvam" or "gemini".
+        method:       "sarvam" or "gcp".
         glossary:     Technical term glossary for code-mixing (auto-loaded if None).
 
     Returns:
@@ -112,7 +105,7 @@ def translate_segments(
         logger.info("Removed filler words from %d/%d segments before translation",
                     n_changed, len(all_segments))
 
-    # Static term list for the GCP / Gemini paths (Sarvam code-mixed mode
+    # Static term list for the GCP path and Sarvam's non-code-mixed modes (code-mixed mode
     # keeps technical terms in English on its own and ignores it)
     if glossary is None and ENABLE_CODE_MIXING:
         glossary = load_default_glossary()
@@ -128,11 +121,7 @@ def translate_segments(
     def _translate_one_lang(lang: str) -> tuple[str, list[Segment]]:
         lang_name = TARGET_LANGUAGES[lang]["name"]
         logger.info("Translating to %s (%s)…", lang_name, lang)
-        if method == "gemini":
-            translated = _translate_batch_gemini(
-                segments, lang, glossary=glossary, terms_in_use=terms_in_use,
-            )
-        elif method == "sarvam":
+        if method == "sarvam":
             translated = _translate_batch_sarvam(
                 segments, lang, glossary=glossary, terms_in_use=terms_in_use,
             )
@@ -163,112 +152,20 @@ def translate_segments(
     return results
 
 
-# ── Gemini batch translation ─────────────────────────────────────────────────
-
-def _translate_batch_gemini(
-    segments: list[Segment], target_lang: str,
-    glossary: Glossary | None = None,
-    terms_in_use: list[str] | None = None,
-) -> list[Segment]:
+def _fail_if_nothing_translated(
+    engine: str, lang_name: str, segments: list[Segment],
+    fallback_count: int, last_error: Exception | None,
+) -> None:
     """
-    Translate a list of segments to `target_lang` using Gemini.
-    Sends segments in batches to stay within token limits.
-    Integrates glossary for code-mixing of technical terms.
+    Both engines keep the English text for a segment whose call failed.  When
+    that happens to every segment the engine is unusable (bad key, no
+    credits, network down) and the "translation" is just English, so fail
+    instead of dubbing English text with a Hindi/Telugu/Odia voice.
     """
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY is not set in .env")
-
-    client = genai.Client(api_key=GEMINI_API_KEY)
-
-    lang_name = TARGET_LANGUAGES[target_lang]["name"]
-    all_translated: list[Segment] = []
-
-    # Build code-mixing prompt section
-    code_mix_section = ""
-    if glossary and terms_in_use:
-        code_mix_section = glossary.build_translation_prompt_section(terms_in_use)
-
-    # Process in batches
-    for batch_start in range(0, len(segments), _BATCH_SIZE):
-        batch = segments[batch_start : batch_start + _BATCH_SIZE]
-        batch_texts = [
-            {
-                "id": i,
-                "text": seg.text,
-                "duration_s": round(seg.end - seg.start, 2),
-            }
-            for i, seg in enumerate(batch)
-        ]
-
-        prompt = f"""Translate the following English text segments into {lang_name}.
-
-Return ONLY a valid JSON array (no markdown, no code fences) where each element is:
-{{"id": <same id as input>, "text": "<translated text in {lang_name}>"}}
-
-Rules:
-- Translate EVERY segment. Do not skip any.
-- Keep technical terms, proper nouns, and acronyms EXACTLY in English as-is. Do NOT transliterate them into the target script and do NOT add transliterations in parentheses.
-- The translation should be natural and fluent in {lang_name}.
-- Do NOT repeat words or phrases. Each sentence should be concise without redundancy.
-- Do NOT add filler translations or paraphrase the same idea multiple times.
-- Keep the same number of segments as input.
-- IMPORTANT: Each segment has a "duration_s" field — the number of seconds the original speaker took. Your translation should be speakable in approximately that many seconds at a natural conversational pace. Prefer concise, fluent phrasing that fits this time budget. Do not pad with extra words.
-- Return ONLY the JSON array, nothing else.{code_mix_section}
-
-Input segments:
-{json.dumps(batch_texts, ensure_ascii=False)}"""
-
-        logger.info("  Batch %d (%d segments) → %s",
-                    batch_start // _BATCH_SIZE + 1, len(batch), lang_name)
-
-        @retry_on_failure(
-            max_retries=3, backoff_base=2.0,
-            retryable_exceptions=(Exception,),
+    if segments and fallback_count >= len(segments):
+        raise RuntimeError(
+            f"{engine} translation to {lang_name} failed for every segment: {last_error}"
         )
-        def _call_gemini(p):
-            return client.models.generate_content(
-                model="gemini-3.6-flash",
-                contents=p,
-                config=types.GenerateContentConfig(
-                    temperature=0.2,
-                    response_mime_type="application/json",
-                ),
-            )
-
-        response = _call_gemini(prompt)
-        raw = response.text.strip()
-
-        # Strip markdown fences if present
-        json_text = raw
-        if json_text.startswith("```"):
-            json_text = re.sub(r"^```(?:json)?\s*", "", json_text)
-            json_text = re.sub(r"\s*```$", "", json_text)
-
-        try:
-            data = json.loads(json_text)
-        except json.JSONDecodeError as e:
-            logger.error("Failed to parse Gemini translation JSON: %s", e)
-            logger.debug("Raw:\n%s", raw[:500])
-            raise ValueError(f"Gemini returned invalid JSON for {lang_name}: {e}")
-
-        # Build a lookup by id for robustness
-        translated_map = {item["id"]: item["text"] for item in data}
-
-        for i, seg in enumerate(batch):
-            new_text = translated_map.get(i, seg.text)  # fallback to English
-
-            # Verify code-mixing: check technical terms are preserved
-            if glossary and terms_in_use:
-                missing = verify_terms_preserved(seg.text, new_text, glossary)
-                if missing:
-                    logger.debug("Terms lost in translation for seg %d: %s", i, missing)
-
-            all_translated.append(
-                Segment(start=seg.start, end=seg.end, text=new_text)
-            )
-
-    logger.info("%s: %d segments translated ✓", lang_name, len(all_translated))
-    return all_translated
 
 
 # ── Term protection helpers (placeholder substitution for non-prompt APIs) ────
@@ -361,6 +258,7 @@ def _translate_batch_sarvam(
     client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
     translated: list[Segment] = []
     fallback_count = 0
+    last_error: Exception | None = None
 
     for i, seg in enumerate(segments):
         text = seg.text.strip()
@@ -398,6 +296,7 @@ def _translate_batch_sarvam(
             new_text = text  # keep original on failure
             placeholder_map = {}
             fallback_count += 1
+            last_error = exc
 
         # Restore placeholders for non-code-mixed modes
         if not use_code_mixed:
@@ -429,6 +328,7 @@ def _translate_batch_sarvam(
     if fallback_count:
         logger.warning("%s: %d/%d segments fell back to English",
                        lang_name, fallback_count, len(segments))
+    _fail_if_nothing_translated("Sarvam", lang_name, segments, fallback_count, last_error)
     logger.info("%s: %d segments translated ✓", lang_name, len(translated))
     return translated
 
@@ -473,6 +373,7 @@ def _translate_batch_gcp(
     url = f"https://translation.googleapis.com/language/translate/v2?key={GCP_API_KEY}"
     all_translated: list[Segment] = []
     fallback_count = 0
+    last_error: Exception | None = None
 
     for batch_start in range(0, len(segments), _GCP_BATCH_SIZE):
         batch = segments[batch_start: batch_start + _GCP_BATCH_SIZE]
@@ -504,6 +405,7 @@ def _translate_batch_gcp(
         except Exception as exc:
             logger.error("[GCP Translate] Batch %d failed: %s — falling back to English",
                          batch_start // _GCP_BATCH_SIZE + 1, exc)
+            last_error = exc
             for seg in batch:
                 all_translated.append(Segment(start=seg.start, end=seg.end, text=seg.text))
             fallback_count += len(batch)
@@ -529,6 +431,7 @@ def _translate_batch_gcp(
     if fallback_count:
         logger.warning("[GCP Translate] %s: %d/%d segments fell back to English",
                        lang_name, fallback_count, len(segments))
+    _fail_if_nothing_translated("Google", lang_name, segments, fallback_count, last_error)
     logger.info("[GCP Translate] %s: %d segments translated ✓", lang_name, len(all_translated))
     return all_translated
 

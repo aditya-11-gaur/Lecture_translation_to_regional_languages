@@ -163,30 +163,7 @@ def check_ffprobe() -> bool:
     return shutil.which("ffprobe") is not None
 
 
-def check_rubberband() -> bool:
-    """Check if ffmpeg was compiled with librubberband support."""
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-filters"],
-            capture_output=True, text=True, timeout=10,
-        )
-        return "rubberband" in result.stdout
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
-
-
-_rubberband_available: bool | None = None
-
-
-def is_rubberband_available() -> bool:
-    """Cached check of rubberband availability."""
-    global _rubberband_available
-    if _rubberband_available is None:
-        _rubberband_available = check_rubberband()
-    return _rubberband_available
-
-
-def run_preflight_checks(require_rubberband: bool = True) -> list[str]:
+def run_preflight_checks() -> list[str]:
     """
     Run all preflight checks and return a list of warnings.
     Raises PreflightError if critical dependencies are missing.
@@ -201,12 +178,6 @@ def run_preflight_checks(require_rubberband: bool = True) -> list[str]:
     if not check_ffprobe():
         raise PreflightError(
             "ffprobe not found on PATH. It usually comes with ffmpeg."
-        )
-
-    if require_rubberband and not check_rubberband():
-        issues.append(
-            "ffmpeg does not include librubberband. Audio time-stretching will "
-            "fall back to atempo (lower quality). Install rubberband for best results."
         )
 
     return issues
