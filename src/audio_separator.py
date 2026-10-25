@@ -137,16 +137,10 @@ def mix_audio_tracks(
     Returns ``output_path`` (or ``speech_path`` when mixing is skipped).
     """
     # ── Energy gate: check if accompaniment has real content ────────────
-    import json as _json
     try:
-        _probe = subprocess.run(
-            ["ffprobe", "-v", "error",
-             "-show_entries", "format_tags=comment",   # dummy — we just need stderr
-             "-of", "json", accompaniment_path],
-            capture_output=True, text=True,
-        )
+        # volumedetect reports at info level — don't pass "-v error" here
         _vol_check = subprocess.run(
-            ["ffmpeg", "-v", "error", "-i", accompaniment_path,
+            ["ffmpeg", "-hide_banner", "-nostats", "-i", accompaniment_path,
              "-af", "volumedetect", "-f", "null", "/dev/null"],
             capture_output=True, text=True,
         )

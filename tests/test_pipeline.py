@@ -19,24 +19,50 @@ class TestPipelineCacheHelpers:
     def test_save_and_load_cache(self, tmp_output_dir):
         from src.pipeline import _save_cache, _load_cache
 
-        _save_cache(tmp_output_dir, "test_key", {"hello": "world"})
-        result = _load_cache(tmp_output_dir, "test_key")
+        _save_cache(tmp_output_dir, "test_key", {"hello": "world"}, "fp1")
+        result = _load_cache(tmp_output_dir, "test_key", "fp1")
         assert result == {"hello": "world"}
 
     @patch("src.pipeline.ENABLE_CACHE", False)
     def test_cache_disabled(self, tmp_output_dir):
         from src.pipeline import _save_cache, _load_cache
 
-        _save_cache(tmp_output_dir, "no_cache", {"data": True})
-        result = _load_cache(tmp_output_dir, "no_cache")
+        _save_cache(tmp_output_dir, "no_cache", {"data": True}, "fp1")
+        result = _load_cache(tmp_output_dir, "no_cache", "fp1")
         assert result is None
 
     @patch("src.pipeline.ENABLE_CACHE", True)
     def test_load_missing_cache(self, tmp_output_dir):
         from src.pipeline import _load_cache
 
-        result = _load_cache(tmp_output_dir, "nonexistent_key")
+        result = _load_cache(tmp_output_dir, "nonexistent_key", "fp1")
         assert result is None
+
+    @patch("src.pipeline.ENABLE_CACHE", True)
+    def test_cache_from_other_inputs_is_ignored(self, tmp_output_dir):
+        """A different video/engine under the same job name must not reuse results."""
+        from src.pipeline import _save_cache, _load_cache
+
+        _save_cache(tmp_output_dir, "english_segments", [{"text": "old lecture"}], "fp_old")
+        assert _load_cache(tmp_output_dir, "english_segments", "fp_new") is None
+
+    @patch("src.pipeline.ENABLE_CACHE", True)
+    def test_untagged_legacy_cache_is_ignored(self, tmp_output_dir):
+        """Caches written before fingerprinting can't be trusted."""
+        from src.pipeline import _cache_dir, _load_cache
+
+        with open(os.path.join(_cache_dir(tmp_output_dir), "english_segments.json"), "w") as f:
+            json.dump([{"start": 0, "end": 1, "text": "old"}], f)
+        assert _load_cache(tmp_output_dir, "english_segments", "fp1") is None
+
+    def test_fingerprint_changes_with_any_input(self):
+        from src.pipeline import _fingerprint
+
+        base = _fingerprint("translated", [{"text": "hi"}], "sarvam", "code-mixed", True)
+        assert base == _fingerprint("translated", [{"text": "hi"}], "sarvam", "code-mixed", True)
+        assert base != _fingerprint("translated", [{"text": "hi"}], "gcp", "code-mixed", True)
+        assert base != _fingerprint("translated", [{"text": "hi"}], "sarvam", "formal", True)
+        assert base != _fingerprint("translated", [{"text": "bye"}], "sarvam", "code-mixed", True)
 
 
 class TestSegmentsFromDicts:
@@ -107,6 +133,7 @@ class TestPipelineSignature:
 class TestPipelinePreflightIntegration:
     """Test that preflight checks are invoked."""
 
+    @patch("src.pipeline.file_sha256", return_value="0" * 64)
     @patch("src.pipeline.run_preflight_checks")
     @patch("src.pipeline.extract_audio", return_value="fake_audio.wav")
     @patch("src.pipeline.transcribe_audio", return_value=[])
@@ -116,7 +143,8 @@ class TestPipelinePreflightIntegration:
     @patch("src.pipeline.ENABLE_CODE_MIXING", False)
     @patch("src.pipeline.ENABLE_VOICE_PRESERVATION", False)
     def test_preflight_called(
-        self, mock_dur, mock_subs, mock_trans, mock_stt, mock_extract, mock_preflight
+        self, mock_dur, mock_subs, mock_trans, mock_stt, mock_extract, mock_preflight,
+        mock_sha,
     ):
         from src.pipeline import run_pipeline
 

@@ -37,7 +37,7 @@ from src.tts_generator import (
 )
 from src.pipeline import run_pipeline
 from src.video_muxer import create_preview_mp4
-from src.voice_converter import is_openvoice_available
+from src.voice_converter import NO_GPU_MESSAGE, is_gpu_available, is_openvoice_available
 from src.audio_separator import is_demucs_available
 from src.lip_sync import is_wav2lip_available, is_wav2lip_repo_present
 
@@ -208,6 +208,7 @@ with st.sidebar:
 
     st.divider()
     _ov_available = is_openvoice_available()
+    _gpu_available = is_gpu_available()
     # _vc engines handle voice cloning internally — no need for Stage 2 expander
     _tts_engine_has_vc = tts_engine is not None and tts_engine.endswith("_vc")
     with st.expander("🎙️ Voice Cloning (Stage 2)", expanded=False):
@@ -216,7 +217,15 @@ with st.sidebar:
             "**Stage 2** — Tone-color transfer: makes the dubbed voice **sound like** the original lecturer.  \n"
         )
         st.divider()
-        if _tts_engine_has_vc:
+        if not _gpu_available:
+            enable_voice_cloning = False
+            st.warning(
+                f"**{NO_GPU_MESSAGE}.**  \n\n"
+                "OpenVoice v2 needs a CUDA GPU. The dub will still be generated "
+                "with the selected TTS engine's own voice.",
+                icon="⚠️",
+            )
+        elif _tts_engine_has_vc:
             enable_voice_cloning = False
             st.info(
                 "✅ **Voice cloning is already included** in the selected TTS engine "
@@ -482,6 +491,10 @@ with tab_run:
             video_name = final_job_name
             run_output = os.path.join(OUTPUT_DIR, video_name)
             os.makedirs(run_output, exist_ok=True)
+            # Previews from an earlier run of this job would show the old audio
+            for f in os.listdir(run_output):
+                if f.startswith(f"{video_name}_preview_") and f.endswith(".mp4"):
+                    os.remove(os.path.join(run_output, f))
 
             # Submit to the global GPU queue — returns immediately with a job_id
             job_id = submit_job(
@@ -555,6 +568,7 @@ with tab_run:
                 "lip_sync_used_wav2lip": result.get("lip_sync_used_wav2lip", False),
                 "lip_sync_errors":       result.get("lip_sync_errors", {}),
                 "lip_synced_mkvs":       result.get("lip_synced_mkvs", {}),
+                "voice_cloning_note":    result.get("voice_cloning_note"),
                 "video_path":            job_meta.get("video_path", ""),
                 "video_name":            video_name,
                 "run_output":            run_output,
@@ -589,6 +603,9 @@ with tab_run:
 
         st.divider()
         st.subheader("📦 Results")
+
+        if res.get("voice_cloning_note"):
+            st.warning(f"🎙️ {res['voice_cloning_note']}.", icon="⚠️")
 
         # ── Video preview with dubbed audio + subtitle overlay ──────
         st.markdown("##### 🎬 Video Preview")

@@ -276,6 +276,27 @@ def _merge_into_sentence_chunks(
     return merged
 
 
+def _snap_to_word_boundary(text: str, pos: int, punct_window: int = 25) -> int:
+    """
+    Move a cut position in *text* to a word boundary.
+
+    Prefers a clause end (",;:.?!" followed by a space) within
+    ``punct_window`` characters, otherwise the nearest space.  Returns
+    ``len(text)`` when the text has no spaces at all (can't be split).
+    """
+    lo, hi = max(0, pos - punct_window), min(len(text), pos + punct_window)
+    clause_ends = [
+        i + 1 for i in range(lo, hi)
+        if text[i] in ",;:.?!" and i + 1 < len(text) and text[i + 1] == " "
+    ]
+    if clause_ends:
+        return min(clause_ends, key=lambda i: abs(i - pos))
+    spaces = [i for i, ch in enumerate(text) if ch == " "]
+    if not spaces:
+        return len(text)
+    return min(spaces, key=lambda i: abs(i - pos))
+
+
 def split_segments_at_silences(
     segments: list[Segment],
     audio_path: str,
@@ -299,7 +320,8 @@ def split_segments_at_silences(
     Each internal silence of >= ``min_silence_sec`` triggers a split at the
     midpoint of that silence gap.  Text is divided proportionally by time
     (good enough given that proportional time ≈ proportional word count
-    for naturally paced speech).
+    for naturally paced speech), with each cut moved to the nearest word
+    boundary — punctuation preferred, since a long pause usually ends a clause.
 
     New segments are also split — if a sub-segment window is still > min_window_sec
     and has further internal silences, it will be split on the NEXT pipeline run
@@ -337,8 +359,9 @@ def split_segments_at_silences(
                  "-ar", "16000", "-ac", "1", tmp_wav],
                 capture_output=True, check=True,
             )
+            # silencedetect reports at info level — don't pass "-v error" here
             res = _sp.run(
-                ["ffmpeg", "-v", "error", "-i", tmp_wav,
+                ["ffmpeg", "-hide_banner", "-nostats", "-i", tmp_wav,
                  "-af", f"silencedetect=noise={silence_db}dB:d={min_silence_sec}",
                  "-f", "null", "/dev/null"],
                 capture_output=True, text=True,
@@ -383,28 +406,33 @@ def split_segments_at_silences(
 
         # Build sub-segment time boundaries
         boundaries = [seg.start] + split_points_abs + [seg.end]
-        total_chars = max(len(seg.text), 1)
-        total_window = window
+
+        # Proportional text cut for each split point, snapped to a word
+        # boundary (preferring punctuation) so no word is cut in half.
+        cuts = [0]
+        for t in split_points_abs:
+            pos = int((t - seg.start) / window * len(seg.text))
+            cuts.append(max(cuts[-1], _snap_to_word_boundary(seg.text, pos)))
+        cuts.append(len(seg.text))
 
         sub_segs: list[Segment] = []
+        carry_start: float | None = None
         for i in range(len(boundaries) - 1):
             t0, t1 = boundaries[i], boundaries[i + 1]
-            sub_dur = t1 - t0
-            if sub_dur < 0.3:
-                continue
-            # Proportional text slice
-            frac0 = (t0 - seg.start) / total_window
-            frac1 = (t1 - seg.start) / total_window
-            c0 = int(frac0 * total_chars)
-            c1 = int(frac1 * total_chars)
-            # Snap c1 to nearest word boundary
-            sub_text = seg.text[c0:c1].strip()
+            sub_text = seg.text[cuts[i]:cuts[i + 1]].strip()
             if not sub_text:
-                sub_text = seg.text.strip()  # fallback: whole text
+                # No words landed in this span — fold its time into a neighbour
+                if sub_segs:
+                    sub_segs[-1].end = round(t1, 3)
+                elif carry_start is None:
+                    carry_start = t0
+                continue
             sub_segs.append(Segment(
-                start=round(t0, 3), end=round(t1, 3),
+                start=round(t0 if carry_start is None else carry_start, 3),
+                end=round(t1, 3),
                 text=sub_text, fillers=[],
             ))
+            carry_start = None
 
         if len(sub_segs) <= 1:
             result.append(seg)

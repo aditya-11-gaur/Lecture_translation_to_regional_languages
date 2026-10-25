@@ -20,9 +20,10 @@ import json
 import logging
 import math
 import os
-import struct
 import subprocess
 from dataclasses import dataclass, field
+
+import numpy as np
 
 logger = logging.getLogger("nptel_pipeline")
 
@@ -140,9 +141,9 @@ def analyze_voice(
     except Exception as exc:
         logger.warning("Volume analysis failed: %s", exc)
 
-    # Pitch analysis (sample first 60s for speed)
+    # Pitch analysis (sample 60 s of non-silent audio for speed)
     try:
-        pitch_info = _analyze_pitch(audio_path, max_seconds=60)
+        pitch_info = _analyze_pitch(audio_path, max_seconds=60, skip_silence=True)
         profile.avg_pitch_hz = pitch_info.get("avg_hz", 0.0)
         profile.pitch_range = pitch_info.get("range", (0.0, 0.0))
 
@@ -204,18 +205,27 @@ def _analyze_volume(audio_path: str) -> dict:
     return info
 
 
-def _analyze_pitch(audio_path: str, max_seconds: float = 60) -> dict:
+def _analyze_pitch(
+    audio_path: str, max_seconds: float = 60, skip_silence: bool = False,
+) -> dict:
     """
-    Estimate fundamental frequency (F0) using zero-crossing rate analysis.
+    Estimate fundamental frequency (F0) by autocorrelation on voiced frames.
 
-    This is a basic approach that works without external dependencies.
-    Only analyses up to max_seconds of audio for speed.
+    Only analyses up to max_seconds of audio for speed.  With
+    ``skip_silence`` the pauses are removed first, so a dubbed track that
+    opens with a long silence still yields max_seconds of speech.
     """
     # Convert to raw PCM for analysis
+    silence_args = (
+        ["-af", "silenceremove=start_periods=1:start_threshold=-40dB"
+                ":stop_periods=-1:stop_duration=0.3:stop_threshold=-40dB"]
+        if skip_silence else []
+    )
     duration_args = ["-t", str(max_seconds)] if max_seconds > 0 else []
     cmd = [
         "ffmpeg", "-y",
         "-i", audio_path,
+        *silence_args,
         *duration_args,
         "-ar", "16000",
         "-ac", "1",
@@ -235,7 +245,7 @@ def _analyze_pitch(audio_path: str, max_seconds: float = 60) -> dict:
     if num_samples == 0:
         return {"avg_hz": 0.0, "range": (0.0, 0.0)}
 
-    samples = struct.unpack(f"<{num_samples}h", raw_data[:num_samples * 2])
+    samples = np.frombuffer(raw_data[:num_samples * 2], dtype="<i2").astype(np.float64)
 
     # Analyze pitch using autocorrelation on voiced frames
     frame_size = int(0.03 * sample_rate)   # 30ms frames
@@ -247,7 +257,7 @@ def _analyze_pitch(audio_path: str, max_seconds: float = 60) -> dict:
         frame = samples[start:start + frame_size]
 
         # Check if frame is voiced (energy above threshold)
-        energy = sum(s * s for s in frame) / len(frame)
+        energy = float(np.dot(frame, frame)) / len(frame)
         if energy < 500000:  # silence/noise threshold
             continue
 
@@ -271,12 +281,13 @@ def _analyze_pitch(audio_path: str, max_seconds: float = 60) -> dict:
     return {"avg_hz": avg_hz, "range": (min_hz, max_hz)}
 
 
-def _autocorrelation_pitch(frame: tuple, sample_rate: int) -> float:
+def _autocorrelation_pitch(frame, sample_rate: int) -> float:
     """
     Estimate pitch of a single frame using autocorrelation.
     Returns estimated frequency in Hz.
     """
-    n = len(frame)
+    x = np.asarray(frame, dtype=np.float64)
+    n = len(x)
     # Search for pitch between 60 Hz and 500 Hz
     min_lag = sample_rate // 500   # 500 Hz
     max_lag = sample_rate // 60    # 60 Hz
@@ -284,46 +295,62 @@ def _autocorrelation_pitch(frame: tuple, sample_rate: int) -> float:
     if max_lag >= n:
         max_lag = n - 1
 
-    best_corr = 0.0
-    best_lag = 0
-
     # Compute energy for normalization
-    energy = sum(s * s for s in frame)
-    if energy == 0:
+    energy = float(np.dot(x, x))
+    if energy == 0 or max_lag <= min_lag:
         return 0.0
 
-    for lag in range(min_lag, max_lag):
-        corr = 0.0
-        for i in range(n - lag):
-            corr += frame[i] * frame[i + lag]
-        corr /= energy
+    # corr[lag] = sum(x[i] * x[i + lag]) / energy, for every lag at once
+    corr = np.correlate(x, x, mode="full")[n - 1:] / energy
+    best_lag = min_lag + int(np.argmax(corr[min_lag:max_lag]))
+    best_corr = corr[best_lag]
 
-        if corr > best_corr:
-            best_corr = corr
-            best_lag = lag
-
-    if best_lag <= 0 or best_corr < 0.25:
+    if best_corr < 0.25:
         return 0.0
 
     return sample_rate / best_lag
+
+
+# Largest post-TTS pitch correction; beyond this, shifting sounds artificial.
+MAX_PITCH_SHIFT_SEMITONES = 6.0
+
+
+def pitch_shift_to_match(profile: VoiceProfile, tts_audio_path: str) -> float:
+    """
+    Semitones to shift *tts_audio_path* so its average pitch matches the
+    original speaker's.
+
+    Measures the TTS audio itself rather than assuming a typical TTS pitch:
+    the voice actually used may be male or female, cloned, or already
+    pitch-adjusted at synthesis time (edge-tts).
+    """
+    if profile.avg_pitch_hz <= 0:
+        return 0.0
+    tts_hz = _analyze_pitch(tts_audio_path, max_seconds=60, skip_silence=True)["avg_hz"]
+    if tts_hz <= 0:
+        return 0.0
+    semitones = 12 * math.log2(profile.avg_pitch_hz / tts_hz)
+    return max(-MAX_PITCH_SHIFT_SEMITONES, min(MAX_PITCH_SHIFT_SEMITONES, semitones))
 
 
 def apply_voice_profile_to_audio(
     audio_path: str,
     profile: VoiceProfile,
     output_path: str,
+    semitones: float | None = None,
 ) -> str:
     """
     Post-process TTS audio to better match the original speaker.
 
-    Applies:
-      1. Pitch shift (semitones) to match original speaker's pitch
-      2. Volume normalization to match original loudness
+    Applies a pitch shift (semitones) to match the original speaker's pitch.
+    ``semitones`` defaults to ``pitch_shift_to_match(profile, audio_path)``.
     """
     filters: list[str] = []
 
+    if semitones is None:
+        semitones = pitch_shift_to_match(profile, audio_path)
+
     # Pitch shift if significant
-    semitones = profile.tts_pitch_adjustment_semitones
     if abs(semitones) > 0.5:
         # Use rubberband for high-quality pitch shifting
         pitch_ratio = 2 ** (semitones / 12)

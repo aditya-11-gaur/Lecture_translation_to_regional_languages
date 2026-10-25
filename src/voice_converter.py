@@ -145,6 +145,16 @@ def _autodetect_device() -> str:
         return "cpu"
 
 
+# OpenVoice's se_extractor runs faster-whisper with device="cuda" hard-coded,
+# so voice cloning cannot run on a CPU-only machine.
+NO_GPU_MESSAGE = "GPU not available — voice cloning is not possible; using the plain TTS voice"
+
+
+def is_gpu_available() -> bool:
+    """Return True if a CUDA GPU is available for voice cloning."""
+    return _autodetect_device() == "cuda"
+
+
 def _get_audio_duration(path: str) -> float:
     """Return duration in seconds of an audio file via ffprobe."""
     import json as _json
@@ -462,7 +472,7 @@ def convert_segments_batch(
     Returns:
         Updated ``{segment_idx: converted_path}`` mapping.
     """
-    global _converter_cache, _target_se_cache, _resemblyzer_encoder  # may be reset on CUDA-not-available
+    global _converter_cache, _target_se_cache, _resemblyzer_encoder  # released after the batch
 
     if not is_openvoice_available():
         logger.warning("[OpenVoice] Library not installed — skipping per-segment conversion")
@@ -470,6 +480,9 @@ def convert_segments_batch(
 
     if device is None:
         device = _autodetect_device()
+    if device != "cuda":
+        logger.warning("[OpenVoice] %s", NO_GPU_MESSAGE)
+        return segment_files
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -511,20 +524,6 @@ def convert_segments_batch(
                         torch.cuda.ipc_collect()
                     except Exception:
                         pass
-                    convert_voice(
-                        tts_audio_path=seg_path,
-                        reference_audio_path=reference_audio_path,
-                        output_path=out_path,
-                        device=device,
-                    )
-                # No CUDA device detected — reset singleton and fall back to CPU
-                elif "no cuda-capable device" in err_str or "cuda failed" in err_str:
-                    logger.warning(
-                        "[OpenVoice] Seg %d: CUDA unavailable — reloading converter on CPU and retrying",
-                        idx,
-                    )
-                    _converter_cache = None  # force reload on CPU
-                    device = "cpu"
                     convert_voice(
                         tts_audio_path=seg_path,
                         reference_audio_path=reference_audio_path,

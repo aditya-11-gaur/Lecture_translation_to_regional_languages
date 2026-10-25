@@ -35,6 +35,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import wave
 
 from src.transcriber import Segment
 from src.utils import is_rubberband_available
@@ -72,6 +73,10 @@ FADE_OUT_MS = 300    # 300 ms – longer fade prevents the "voice snap" artefact
 # by up to this many seconds (instead of hard-truncation).
 OVERLAP_TOLERANCE_S = 1.5
 
+# A bleeding segment always leaves at least this much silence before the
+# next sentence so the two don't run together.
+MIN_PAUSE_S = 0.15
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -87,6 +92,15 @@ def _get_duration(audio_path: str) -> float:
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     info = json.loads(result.stdout)
     return float(info["format"]["duration"])
+
+
+def _wav_duration(wav_path: str) -> float:
+    """Exact duration of an intermediate PCM WAV (falls back to ffprobe)."""
+    try:
+        with wave.open(wav_path, "rb") as w:
+            return w.getnframes() / w.getframerate()
+    except (wave.Error, EOFError, OSError):
+        return _get_duration(wav_path)
 
 
 def _rubberband_stretch(
@@ -402,8 +416,9 @@ def _voiced_end_in_window(
             capture_output=True, check=True,
         )
 
+        # silencedetect reports at info level — don't pass "-v error" here
         result = subprocess.run(
-            ["ffmpeg", "-v", "error", "-i", seg_wav,
+            ["ffmpeg", "-hide_banner", "-nostats", "-i", seg_wav,
              "-af", f"silencedetect=noise={silence_db}dB:d={min_silence_dur}",
              "-f", "null", "/dev/null"],
             capture_output=True, text=True,
@@ -495,7 +510,11 @@ def align_dubbed_audio(
     with tempfile.TemporaryDirectory(prefix="align_") as tmp_dir:
         pieces: list[str] = []   # ordered list of WAV files to concat
 
-        prev_end = 0.0
+        # Where the assembled track actually ends so far.  Every gap is
+        # measured from here rather than from the previous segment's nominal
+        # end, so a piece that runs long (bleed) or short (VAD trim) can never
+        # shift the segments that follow it.
+        cursor = 0.0
 
         # Pre-compute the gap *after* each segment (to the next segment's start).
         # This lets us decide how much overlap we can tolerate.
@@ -509,24 +528,25 @@ def align_dubbed_audio(
                 gap_after.append(total_duration - original_segments[idx].end)
 
         for idx, seg in enumerate(original_segments):
-            gap = seg.start - prev_end
+            gap = seg.start - cursor
 
             if gap < -0.05:
                 logger.warning(
-                    "Segment %d starts %.3fs before previous end (overlap); "
-                    "clamping to prev_end=%.3f",
-                    idx, -gap, prev_end,
+                    "Segment %d starts %.3fs before the previous audio ends; "
+                    "starting it at %.3fs instead",
+                    idx, -gap, cursor,
                 )
-                gap = 0.0
 
             # Insert silence to fill the gap before this segment
             if gap > 0.05:
                 sil_path = os.path.join(tmp_dir, f"sil_{idx:04d}.wav")
                 _generate_silence(gap, sil_path)
                 pieces.append(sil_path)
+                cursor += _wav_duration(sil_path)
 
             if idx in segment_audio_files and os.path.isfile(segment_audio_files[idx]):
-                target_dur = seg.end - max(seg.start, prev_end if gap < 0 else seg.start)
+                # If we're starting late, aim to still finish on time
+                target_dur = seg.end - max(seg.start, cursor)
                 if target_dur <= 0:
                     target_dur = seg.end - seg.start
 
@@ -547,20 +567,23 @@ def align_dubbed_audio(
                     voiced_end = _voiced_end_in_window(
                         source_audio_path, seg.start, seg.end, tmp_dir,
                     )
-                    # Only shrink the target (never expand beyond original window)
+                    # Only shrink the target (never expand beyond original window),
+                    # and never below the TTS's natural length — the window has
+                    # room, so there's no reason to speed the speech up.
                     if voiced_end < target_dur * 0.85:
+                        new_target = max(voiced_end, tts_dur)
                         logger.debug(
                             "Seg %d: VAD-trimmed target %.1fs → %.1fs (saves %.1fs silence)",
-                            idx, target_dur, voiced_end, target_dur - voiced_end,
+                            idx, target_dur, new_target, target_dur - new_target,
                         )
-                        target_dur = voiced_end
+                        target_dur = new_target
                         raw_ratio = tts_dur / target_dur if target_dur > 0 else 1.0
 
                 # ── Smart overlap: extend target if there's room after ──
                 # Allows the TTS audio to breathe into the gap instead of
                 # being stretched aggressively or hard-truncated.
                 available_bleed = min(
-                    max(gap_after[idx], 0.0),
+                    max(gap_after[idx] - MIN_PAUSE_S, 0.0),
                     OVERLAP_TOLERANCE_S,
                 )
 
@@ -574,26 +597,18 @@ def align_dubbed_audio(
                         idx, extra, raw_ratio, tts_dur / effective_dur,
                     )
                     target_dur = effective_dur
-                    # Reduce the gap that will be inserted before the NEXT segment
-                    gap_after[idx] -= extra
 
                 stretched_path = os.path.join(tmp_dir, f"seg_{idx:04d}_stretched.wav")
                 _time_stretch_segment(
                     segment_audio_files[idx], target_dur, stretched_path,
                 )
                 pieces.append(stretched_path)
-            else:
-                # No TTS for this segment → fill with silence
-                seg_dur = seg.end - seg.start
-                if seg_dur > 0:
-                    sil_path = os.path.join(tmp_dir, f"fill_{idx:04d}.wav")
-                    _generate_silence(seg_dur, sil_path)
-                    pieces.append(sil_path)
-
-            prev_end = seg.end
+                cursor += _wav_duration(stretched_path)
+            # No TTS for this segment → nothing to add; the next gap (measured
+            # from the cursor) fills its window with silence.
 
         # Trailing silence after last segment
-        trailing = total_duration - prev_end
+        trailing = total_duration - cursor
         if trailing > 0.1:
             trail_path = os.path.join(tmp_dir, "trailing.wav")
             _generate_silence(trailing, trail_path)

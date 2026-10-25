@@ -16,6 +16,7 @@ Supports:
 """
 
 from __future__ import annotations
+import hashlib
 import json
 import logging
 import os
@@ -35,6 +36,7 @@ from config.settings import (
     DEFAULT_TARGET_LANGS,
     DEFAULT_TTS_ENGINE,
     SEPARATE_MUSIC,
+    SARVAM_TRANSLATION_MODE,
 )
 from src.audio_extractor import extract_audio
 from src.transcriber import transcribe_audio, split_segments_at_silences, Segment
@@ -44,13 +46,15 @@ from src.tts_generator import synthesize_all_segments
 from config.settings import ENABLE_VOICE_CLONING as _DEFAULT_VOICE_CLONING
 from src.audio_aligner import align_dubbed_audio
 from src.video_muxer import mux_to_mkv
-from src.utils import run_preflight_checks, setup_logging
+from src.utils import file_sha256, run_preflight_checks, setup_logging
 from src.glossary import generate_glossary_from_transcript, load_default_glossary, Glossary
-from src.voice_analyzer import analyze_voice, apply_voice_profile_to_audio, VoiceProfile
+from src.voice_analyzer import (
+    analyze_voice, apply_voice_profile_to_audio, pitch_shift_to_match, VoiceProfile,
+)
 from src.filler_detector import build_filler_map_for_alignment
 from src.voice_converter import (
-    convert_all_tracks, convert_segments_batch,
-    extract_reference_clip, is_openvoice_available,
+    NO_GPU_MESSAGE, convert_all_tracks, convert_segments_batch,
+    extract_reference_clip, is_gpu_available, is_openvoice_available,
 )
 from src.audio_separator import (
     separate_audio, mix_all_tracks, is_demucs_available,
@@ -82,26 +86,40 @@ def _cache_dir(output_dir: str) -> str:
     return d
 
 
-def _save_cache(output_dir: str, key: str, data: object) -> None:
-    """Persist a JSON-serialisable object to the run cache."""
+def _fingerprint(*parts: object) -> str:
+    """Stable hash of everything a cached artefact was computed from."""
+    blob = json.dumps(parts, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _save_cache(output_dir: str, key: str, data: object, fingerprint: str) -> None:
+    """Persist a JSON-serialisable object to the run cache, tagged with its inputs."""
     if not ENABLE_CACHE:
         return
     path = os.path.join(_cache_dir(output_dir), f"{key}.json")
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump({"fingerprint": fingerprint, "data": data}, f, ensure_ascii=False, indent=2)
     logger.debug("Cache saved: %s", path)
 
 
-def _load_cache(output_dir: str, key: str) -> object | None:
-    """Load a cached artefact if it exists and caching is enabled."""
+def _load_cache(output_dir: str, key: str, fingerprint: str) -> object | None:
+    """
+    Load a cached artefact if caching is enabled and it was computed from the
+    same inputs (*fingerprint*).  A cache left by a different video, engine or
+    setting under the same job name is ignored.
+    """
     if not ENABLE_CACHE:
         return None
     path = os.path.join(_cache_dir(output_dir), f"{key}.json")
-    if os.path.isfile(path):
-        with open(path, "r", encoding="utf-8") as f:
-            logger.info("Resuming from cache: %s", key)
-            return json.load(f)
-    return None
+    if not os.path.isfile(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict) or payload.get("fingerprint") != fingerprint:
+        logger.info("Cache '%s' is from a different video or settings — recomputing", key)
+        return None
+    logger.info("Resuming from cache: %s", key)
+    return payload["data"]
 
 
 def _segments_from_dicts(dicts: list[dict]) -> list[Segment]:
@@ -221,7 +239,8 @@ def run_pipeline(
     if ENABLE_VOICE_PRESERVATION and do_tts:
         progress(1, total_steps, "Analysing speaker voice characteristics")
         try:
-            voice_profile = analyze_voice(audio_path)
+            # Isolated vocals when available — background music skews the pitch
+            voice_profile = analyze_voice(stt_audio_path)
             logger.info("Voice profile: rate=%.2f wps, pitch=%.0fHz",
                         voice_profile.speaking_rate_wps, voice_profile.avg_pitch_hz)
         except Exception as exc:
@@ -229,7 +248,10 @@ def run_pipeline(
 
     # ── Step 2: Transcribe (English STT) ─────────────────────
     progress(2, total_steps, "Transcribing English audio")
-    cached_en = _load_cache(output_dir, "english_segments")
+    # Caches are tagged with what produced them, so a different video under
+    # the same job name — or a different engine/setting — is never reused.
+    en_fp = _fingerprint("english", file_sha256(video_path), stt_method, separate_music)
+    cached_en = _load_cache(output_dir, "english_segments", en_fp)
     if cached_en is not None:
         english_segments = _segments_from_dicts(cached_en)
         logger.info("Loaded %d cached English segments", len(english_segments))
@@ -281,12 +303,16 @@ def run_pipeline(
                 english_segments, stt_audio_path
             )
         _save_cache(output_dir, "english_segments",
-                    [s.to_dict() for s in english_segments])
+                    [s.to_dict() for s in english_segments], en_fp)
     artefacts["english_segments"] = [s.to_dict() for s in english_segments]
 
     # ── Step 3: Translate ──────────────────────────────────
     progress(3, total_steps, "Translating segments…")
-    cached_trans = _load_cache(output_dir, "translated_segments")
+    tr_fp = _fingerprint(
+        "translated", artefacts["english_segments"],
+        translate_method, SARVAM_TRANSLATION_MODE, enable_glossary,
+    )
+    cached_trans = _load_cache(output_dir, "translated_segments", tr_fp)
     if cached_trans is not None:
         # data is {lang: [dict, ...]}
         translated = {
@@ -309,7 +335,7 @@ def run_pipeline(
                 translated.update(new_trans)
                 # Update cache
                 cached_trans.update({l: [s.__dict__ for s in segs] for l, segs in new_trans.items()})
-                _save_cache(output_dir, "translated_segments", cached_trans)
+                _save_cache(output_dir, "translated_segments", cached_trans, tr_fp)
                 config.settings.ENABLE_CODE_MIXING = original_glossary_setting
             except Exception as exc:
                 config.settings.ENABLE_CODE_MIXING = original_glossary_setting
@@ -333,7 +359,7 @@ def run_pipeline(
 
         _save_cache(output_dir, "translated_segments", {
             l: [s.__dict__ for s in segs] for l, segs in translated.items()
-        })
+        }, tr_fp)
     artefacts["translated"] = translated
 
     # ── Step 4: Generate subtitles (.srt) ────────────────────
@@ -368,7 +394,13 @@ def run_pipeline(
         # Skip when the chosen TTS engine already handles voice cloning
         # internally (e.g. "sarvam_vc"), to avoid double-conversion.
         vc_handled_by_engine = tts_engine in ("sarvam_vc", "gcptts_vc")
-        if enable_voice_cloning and not vc_handled_by_engine:
+        if (enable_voice_cloning or vc_handled_by_engine) and not is_gpu_available():
+            # The _vc engines also skip cloning on their own; record it so the
+            # UI can tell the user why the dub uses the plain TTS voice.
+            logger.warning(NO_GPU_MESSAGE)
+            artefacts["voice_cloned"] = False
+            artefacts["voice_cloning_note"] = NO_GPU_MESSAGE
+        elif enable_voice_cloning and not vc_handled_by_engine:
             if not is_openvoice_available():
                 logger.warning(
                     "Voice cloning requested but OpenVoice v2 is not installed. "
@@ -379,18 +411,13 @@ def run_pipeline(
                 ref_path = os.path.join(output_dir, f"{video_name}_reference_clip.wav")
                 try:
                     extract_reference_clip(audio_path, ref_path)
-                    try:
-                        import torch as _torch
-                        vc_device = "cuda" if _torch.cuda.is_available() else "cpu"
-                    except ImportError:
-                        vc_device = "cpu"
 
                     vc_per_seg: dict[str, dict[int, str]] = {}
                     for lang_code, seg_files in per_seg_files.items():
                         vc_dir = os.path.join(output_dir, f"vc_segments_{lang_code}")
                         os.makedirs(vc_dir, exist_ok=True)
                         vc_per_seg[lang_code] = convert_segments_batch(
-                            seg_files, ref_path, vc_dir, device=vc_device,
+                            seg_files, ref_path, vc_dir, device="cuda",
                         )
                     per_seg_files = vc_per_seg
                     artefacts["voice_cloned"] = True
@@ -454,13 +481,15 @@ def run_pipeline(
                         f"{video_name}_{lang_code}_aligned_pitched.mp3",
                     )
                     try:
+                        # Measured from the dubbed track itself, so it is right
+                        # whichever voice (male/female/cloned) was used
+                        shift = pitch_shift_to_match(voice_profile, out_path)
                         apply_voice_profile_to_audio(
-                            out_path, voice_profile, pitched_path,
+                            out_path, voice_profile, pitched_path, semitones=shift,
                         )
                         out_path = pitched_path
                         logger.info("%s: applied pitch shift (%.1f semitones)",
-                                    lang_name,
-                                    voice_profile.tts_pitch_adjustment_semitones)
+                                    lang_name, shift)
                     except Exception as pexc:
                         logger.warning("Pitch shift failed for %s: %s", lang_name, pexc)
                 aligned_audio[lang_code] = out_path

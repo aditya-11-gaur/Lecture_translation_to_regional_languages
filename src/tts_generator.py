@@ -30,6 +30,7 @@ from config.settings import (
 from src.transcriber import Segment
 from src.voice_analyzer import VoiceProfile
 from src.filler_detector import get_text_without_fillers, get_text_with_target_fillers
+from src.utils import file_sha256
 
 logger = logging.getLogger("nptel_pipeline")
 
@@ -346,6 +347,7 @@ def synthesize_segments(
             segments, lang_code, seg_dir,
             preserve_fillers=preserve_fillers,
             original_segments=original_segments,
+            voice_profile=voice_profile,
         )
     elif engine == "sarvam_vc":
         segment_files = _synth_segments_sarvam_vc(
@@ -353,12 +355,14 @@ def synthesize_segments(
             preserve_fillers=preserve_fillers,
             original_segments=original_segments,
             voice_reference_audio=voice_reference_audio,
+            voice_profile=voice_profile,
         )
     elif engine == "gcptts":
         segment_files = _synth_segments_gcptts(
             segments, lang_code, seg_dir,
             preserve_fillers=preserve_fillers,
             original_segments=original_segments,
+            voice_profile=voice_profile,
         )
         if not segment_files:
             logger.warning("[GCP TTS] All segments failed — falling back to sarvam engine")
@@ -366,6 +370,7 @@ def synthesize_segments(
                 segments, lang_code, seg_dir,
                 preserve_fillers=preserve_fillers,
                 original_segments=original_segments,
+                voice_profile=voice_profile,
             )
     elif engine == "gcptts_vc":
         segment_files = _synth_segments_gcptts_vc(
@@ -373,6 +378,7 @@ def synthesize_segments(
             preserve_fillers=preserve_fillers,
             original_segments=original_segments,
             voice_reference_audio=voice_reference_audio,
+            voice_profile=voice_profile,
         )
         if not segment_files:
             logger.warning("[GCP TTS VC] All segments failed — falling back to sarvam_vc engine")
@@ -381,6 +387,7 @@ def synthesize_segments(
                 preserve_fillers=preserve_fillers,
                 original_segments=original_segments,
                 voice_reference_audio=voice_reference_audio,
+                voice_profile=voice_profile,
             )
     elif engine == "xtts":
         segment_files = _synth_segments_xtts(
@@ -622,6 +629,7 @@ def _synth_segments_sarvam(
     segments: list[Segment], lang_code: str, out_dir: str,
     preserve_fillers: bool = True,
     original_segments: list[Segment] | None = None,
+    voice_profile: VoiceProfile | None = None,
 ) -> dict[int, str]:
     """
     Synthesise each segment with Sarvam Bulbul v3, returning index → file map.
@@ -629,6 +637,8 @@ def _synth_segments_sarvam(
     When *original_segments* is provided, the ``pace`` parameter is estimated
     per-segment so the output duration roughly matches the target window,
     minimising the rubber-band stretch the aligner needs to apply.
+
+    A male speaker voice is used when *voice_profile* says the lecturer is male.
     """
     import base64
     from sarvamai import SarvamAI
@@ -640,7 +650,8 @@ def _synth_segments_sarvam(
     lang_info = TARGET_LANGUAGES[lang_code]
     lang_name = lang_info["name"]
     sarvam_code = lang_info["sarvam_code"]
-    speaker = SARVAM_SPEAKERS.get(lang_code, "priya")
+    speaker = _select_sarvam_speaker(lang_code, voice_profile)
+    logger.info("[Sarvam] %s voice: %s", lang_name, speaker)
     natural_cps = _SARVAM_NATURAL_CPS.get(lang_code, 5.5)
 
     # Build per-segment target durations when available
@@ -744,6 +755,7 @@ def _synth_segments_sarvam_vc(
     preserve_fillers: bool = True,
     original_segments: list[Segment] | None = None,
     voice_reference_audio: str | None = None,
+    voice_profile: VoiceProfile | None = None,
 ) -> dict[int, str]:
     """
     Combined engine: Sarvam bulbul:v3 TTS → OpenVoice v2 voice cloning.
@@ -763,6 +775,7 @@ def _synth_segments_sarvam_vc(
         segments, lang_code, out_dir,
         preserve_fillers=preserve_fillers,
         original_segments=original_segments,
+        voice_profile=voice_profile,
     )
 
     if not sarvam_files:
@@ -775,8 +788,10 @@ def _synth_segments_sarvam_vc(
 
     try:
         from src.voice_converter import (
+            NO_GPU_MESSAGE,
             convert_segments_batch,
             extract_reference_clip,
+            is_gpu_available,
             is_openvoice_available,
         )
     except ImportError:
@@ -790,6 +805,10 @@ def _synth_segments_sarvam_vc(
         )
         return sarvam_files
 
+    if not is_gpu_available():
+        logger.warning("[sarvam_vc] %s", NO_GPU_MESSAGE)
+        return sarvam_files
+
     # Extract a clean reference clip from the original lecture audio
     ref_path = os.path.join(out_dir, "_vc_reference.wav")
     try:
@@ -798,18 +817,12 @@ def _synth_segments_sarvam_vc(
         logger.error("[sarvam_vc] Reference clip extraction failed: %s — skipping voice clone", exc)
         return sarvam_files
 
-    try:
-        import torch as _torch
-        vc_device = "cuda" if _torch.cuda.is_available() else "cpu"
-    except ImportError:
-        vc_device = "cpu"
-
     vc_dir = os.path.join(out_dir, "vc_converted")
     os.makedirs(vc_dir, exist_ok=True)
 
-    logger.info("[sarvam_vc] Applying voice cloning to %d segments (device=%s)…", len(sarvam_files), vc_device)
+    logger.info("[sarvam_vc] Applying voice cloning to %d segments on GPU…", len(sarvam_files))
     converted = convert_segments_batch(
-        sarvam_files, ref_path, vc_dir, device=vc_device,
+        sarvam_files, ref_path, vc_dir, device="cuda",
     )
     truly_converted = sum(1 for idx, path in converted.items() if path != sarvam_files.get(idx))
     if truly_converted == len(sarvam_files):
@@ -904,6 +917,20 @@ SARVAM_SPEAKERS: dict[str, str] = {
     "te": "kavitha",
     "od": "priya",
 }
+
+# Male bulbul:v3 speakers, used when the lecturer is male
+SARVAM_SPEAKERS_MALE: dict[str, str] = {
+    "hi": "aditya",
+    "te": "aditya",
+    "od": "aditya",
+}
+
+
+def _select_sarvam_speaker(lang_code: str, voice_profile: VoiceProfile | None = None) -> str:
+    """Pick a Sarvam speaker whose gender matches the original lecturer."""
+    if voice_profile and voice_profile.is_male:
+        return SARVAM_SPEAKERS_MALE.get(lang_code, "aditya")
+    return SARVAM_SPEAKERS.get(lang_code, "priya")
 
 
 def _generate_sarvam_tts(
@@ -1125,6 +1152,22 @@ def build_xtts_reference_clips(
     """
     os.makedirs(cache_dir, exist_ok=True)
 
+    # ── Discard clips cut from a different lecture ────────────────────
+    # The job folder can be reused for a new video under the same name.
+    source_id = file_sha256(audio_path)
+    marker = os.path.join(cache_dir, "source.sha256")
+    try:
+        with open(marker, encoding="utf-8") as f:
+            same_source = f.read().strip() == source_id
+    except OSError:
+        same_source = False
+    if not same_source:
+        for f in os.listdir(cache_dir):
+            if f.startswith("xtts_ref_") and f.endswith(".wav"):
+                os.remove(os.path.join(cache_dir, f))
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write(source_id)
+
     # ── Check cached clips from a previous run ────────────────────────
     # Only reuse if every cached file is valid (non-empty, has real audio).
     cached = sorted(
@@ -1276,7 +1319,7 @@ def build_xtts_reference_clips(
 # Odia (or-IN) is not yet supported by Cloud TTS → fall through to Sarvam.
 _GCP_TTS_VOICES: dict[str, dict] = {
     #  lang_code  : { bcp47 , male voice              , female voice             }
-    "hi": {"bcp47": "hi-IN",  "male": "hi-IN-Neural2-B",  "female": "hi-IN-Neural2-C"},
+    "hi": {"bcp47": "hi-IN",  "male": "hi-IN-Neural2-B",  "female": "hi-IN-Neural2-A"},
     "te": {"bcp47": "te-IN",  "male": "te-IN-Standard-B", "female": "te-IN-Standard-A"},
     # "od" intentionally omitted — Cloud TTS does not support Odia
 }
@@ -1334,6 +1377,7 @@ def _synth_segments_gcptts(
             segments, lang_code, out_dir,
             preserve_fillers=preserve_fillers,
             original_segments=original_segments,
+            voice_profile=voice_profile,
         )
 
     # Choose male/female voice based on voice profile
@@ -1497,8 +1541,10 @@ def _synth_segments_gcptts_vc(
 
     try:
         from src.voice_converter import (
+            NO_GPU_MESSAGE,
             convert_segments_batch,
             extract_reference_clip,
+            is_gpu_available,
             is_openvoice_available,
         )
     except ImportError:
@@ -1509,6 +1555,10 @@ def _synth_segments_gcptts_vc(
         logger.warning("[gcptts_vc] OpenVoice v2 not installed — returning plain GCP TTS output")
         return gcp_files
 
+    if not is_gpu_available():
+        logger.warning("[gcptts_vc] %s", NO_GPU_MESSAGE)
+        return gcp_files
+
     ref_path = os.path.join(out_dir, "_gcptts_vc_reference.wav")
     try:
         extract_reference_clip(voice_reference_audio, ref_path)
@@ -1516,18 +1566,11 @@ def _synth_segments_gcptts_vc(
         logger.error("[gcptts_vc] Reference clip extraction failed: %s — skipping voice clone", exc)
         return gcp_files
 
-    try:
-        import torch as _torch
-        vc_device = "cuda" if _torch.cuda.is_available() else "cpu"
-    except ImportError:
-        vc_device = "cpu"
-
     vc_dir = os.path.join(out_dir, "vc_converted_gcp")
     os.makedirs(vc_dir, exist_ok=True)
 
-    logger.info("[gcptts_vc] Applying voice cloning to %d segments (device=%s)…",
-                len(gcp_files), vc_device)
-    converted = convert_segments_batch(gcp_files, ref_path, vc_dir, device=vc_device)
+    logger.info("[gcptts_vc] Applying voice cloning to %d segments on GPU…", len(gcp_files))
+    converted = convert_segments_batch(gcp_files, ref_path, vc_dir, device="cuda")
     logger.info("[gcptts_vc] Done: %d/%d segments converted", len(converted), len(gcp_files))
     return converted
 

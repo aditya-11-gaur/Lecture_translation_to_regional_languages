@@ -7,6 +7,7 @@ Shared utilities: retry logic, logging setup, preflight checks.
 from __future__ import annotations
 
 import functools
+import hashlib
 import logging
 import os
 import shutil
@@ -132,6 +133,17 @@ def retry_on_failure_async(
             raise last_exc
         return wrapper
     return decorator
+
+
+# ── File identity ────────────────────────────────────────────────────────────
+
+def file_sha256(path: str) -> str:
+    """SHA-256 of a file's contents — identifies a video/audio across runs."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 # ── Preflight checks ─────────────────────────────────────────────────────────

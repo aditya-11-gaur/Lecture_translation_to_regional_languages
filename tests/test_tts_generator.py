@@ -2,6 +2,7 @@
 Tests for src/tts_generator.py – TTS synthesis (mocked).
 """
 
+import os
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
@@ -306,3 +307,61 @@ class TestGenderAwareVoiceSelection:
 
     def test_male_and_female_maps_have_same_keys(self):
         assert set(EDGE_TTS_VOICES_MALE.keys()) == set(EDGE_TTS_VOICES_FEMALE.keys())
+
+
+class TestGenderAwareEngineVoices:
+    """Sarvam and Google TTS must also get a voice matching the speaker's gender."""
+
+    def test_sarvam_male_speaker(self):
+        from src.tts_generator import _select_sarvam_speaker, SARVAM_SPEAKERS_MALE
+        profile = VoiceProfile(is_male=True, avg_pitch_hz=140.0)
+        assert _select_sarvam_speaker("te", profile) == SARVAM_SPEAKERS_MALE["te"]
+
+    def test_sarvam_female_or_unknown_speaker(self):
+        from src.tts_generator import _select_sarvam_speaker, SARVAM_SPEAKERS
+        assert _select_sarvam_speaker("hi", VoiceProfile(is_male=False)) == SARVAM_SPEAKERS["hi"]
+        assert _select_sarvam_speaker("hi", None) == SARVAM_SPEAKERS["hi"]
+
+    @pytest.mark.parametrize("engine, impl", [
+        ("sarvam", "_synth_segments_sarvam"),
+        ("sarvam_vc", "_synth_segments_sarvam_vc"),
+        ("gcptts", "_synth_segments_gcptts"),
+        ("gcptts_vc", "_synth_segments_gcptts_vc"),
+    ])
+    def test_engine_receives_voice_profile(self, engine, impl, sample_segments, tmp_output_dir):
+        from src.tts_generator import synthesize_segments
+        profile = VoiceProfile(is_male=True, avg_pitch_hz=140.0)
+        with patch(f"src.tts_generator.{impl}", return_value={0: "seg.mp3"}) as mock_impl:
+            synthesize_segments(sample_segments, "hi", tmp_output_dir,
+                                engine=engine, voice_profile=profile)
+        assert mock_impl.call_args.kwargs["voice_profile"] is profile
+
+
+class TestVoiceCloningNeedsGPU:
+    """Voice cloning is skipped cleanly (not attempted per segment) without a GPU."""
+
+    def test_batch_returns_tts_audio_on_cpu(self, tmp_output_dir):
+        from src import voice_converter
+        files = {0: "seg_0000.mp3", 1: "seg_0001.mp3"}
+        with patch.object(voice_converter, "is_openvoice_available", return_value=True), \
+             patch.object(voice_converter, "convert_voice") as mock_convert:
+            result = voice_converter.convert_segments_batch(
+                files, "ref.wav", tmp_output_dir, device="cpu",
+            )
+        assert result == files
+        mock_convert.assert_not_called()
+
+    def test_sarvam_vc_skips_cloning_without_gpu(self, sample_segments, tmp_output_dir):
+        from src import tts_generator, voice_converter
+        sarvam_files = {0: "seg_0000.mp3"}
+        ref = os.path.join(tmp_output_dir, "lecture.wav")
+        open(ref, "wb").close()
+        with patch.object(tts_generator, "_synth_segments_sarvam", return_value=sarvam_files), \
+             patch.object(voice_converter, "is_openvoice_available", return_value=True), \
+             patch.object(voice_converter, "is_gpu_available", return_value=False), \
+             patch.object(voice_converter, "convert_segments_batch") as mock_batch:
+            result = tts_generator._synth_segments_sarvam_vc(
+                sample_segments, "hi", tmp_output_dir, voice_reference_audio=ref,
+            )
+        assert result == sarvam_files
+        mock_batch.assert_not_called()
