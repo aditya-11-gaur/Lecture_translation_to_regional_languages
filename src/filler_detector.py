@@ -188,13 +188,22 @@ def build_filler_map_for_alignment(
 
 
 def get_text_without_fillers(text: str) -> str:
-    """Remove filler words from text for cleaner TTS synthesis."""
+    """
+    Remove filler words from text for cleaner translation / TTS synthesis.
+
+    A sentence end carried by a removed filler ("… the result ah.") is moved
+    onto the previous word so sentence boundaries survive.
+    """
     words = text.split()
     cleaned = []
     for word in words:
         clean = word.strip().lower().rstrip(".,!?;:")
         if clean not in FILLER_WORDS:
             cleaned.append(word)
+            continue
+        sentence_end = word[len(word.rstrip(".!?")):]
+        if sentence_end and cleaned and cleaned[-1][-1] not in ".!?":
+            cleaned[-1] = cleaned[-1].rstrip(",;:") + sentence_end
     result = " ".join(cleaned)
     # Clean up double spaces
     while "  " in result:

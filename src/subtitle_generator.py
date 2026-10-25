@@ -110,7 +110,8 @@ def generate_srt(
         if total_duration is not None:
             start = min(start, total_duration)
             end = min(end, total_duration)
-        if end <= start:
+        # Skip empty cues (e.g. a segment that was only a filler like "ah")
+        if end <= start or not seg.text.strip():
             continue
         counter += 1
         start_ts = _format_srt_timestamp(start)
@@ -157,7 +158,8 @@ def generate_vtt(
         if total_duration is not None:
             start = min(start, total_duration)
             end = min(end, total_duration)
-        if end <= start:
+        # Skip empty cues (e.g. a segment that was only a filler like "ah")
+        if end <= start or not seg.text.strip():
             continue
         counter += 1
         start_ts = _format_vtt_timestamp(start)

@@ -169,3 +169,16 @@ class TestCodeMixedSubtitles:
         # Should split into 2 lines
         lines = result.split("\n")
         assert len(lines) == 2
+
+
+class TestEmptyCuesSkipped:
+    """A translated segment can be empty (it was only a filler like "ah")."""
+
+    def test_srt_and_vtt_skip_empty_text(self, tmp_output_dir):
+        from src.subtitle_generator import generate_srt, generate_vtt
+
+        segs = [Segment(0.0, 2.0, "Hello."), Segment(2.5, 3.0, ""), Segment(3.5, 5.0, "Bye.")]
+        srt = open(generate_srt(segs, "hi", "empty", tmp_output_dir), encoding="utf-8-sig").read()
+        vtt = open(generate_vtt(segs, "hi", "empty", tmp_output_dir), encoding="utf-8").read()
+        assert srt.count("-->") == 2 and vtt.count("-->") == 2
+        assert "\n2\n" in srt and "\n3\n" not in srt   # numbering stays consecutive

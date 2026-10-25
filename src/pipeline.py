@@ -47,7 +47,6 @@ from config.settings import ENABLE_VOICE_CLONING as _DEFAULT_VOICE_CLONING
 from src.audio_aligner import align_dubbed_audio
 from src.video_muxer import mux_to_mkv
 from src.utils import file_sha256, run_preflight_checks, setup_logging
-from src.glossary import generate_glossary_from_transcript, load_default_glossary, Glossary
 from src.voice_analyzer import (
     analyze_voice, apply_voice_profile_to_audio, pitch_shift_to_match, VoiceProfile,
 )

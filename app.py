@@ -174,9 +174,13 @@ with st.sidebar:
         )
         
         enable_enhancer = st.checkbox(
-            "Enable Neural Audio Enhancer",
+            "Enable Noise Removal (DeepFilterNet)",
             value=False,
-            help="Experimental: Use AI to hallucinate high-frequency resolution (Super-Resolution).",
+            help=(
+                "Experimental: runs the DeepFilterNet3 speech denoiser over the "
+                "dubbed voice track to remove hiss and background noise. "
+                "TTS output is usually clean already, so the effect is often small."
+            ),
         )
 
     tts_possible = is_tts_available()

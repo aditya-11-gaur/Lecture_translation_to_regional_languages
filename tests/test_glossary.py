@@ -5,19 +5,15 @@ Tests for src/glossary.py – technical term code-mixing for NPTEL courses.
 import json
 import os
 import tempfile
-from unittest.mock import patch, MagicMock
 
 import pytest
 
 from src.glossary import (
     DEFAULT_GLOSSARY,
     Glossary,
-    generate_glossary_from_transcript,
     load_default_glossary,
     load_glossary_from_file,
     verify_terms_preserved,
-    _GLOSSARY_PROMPT,
-    _MAX_TRANSCRIPT_CHARS,
 )
 
 
@@ -142,145 +138,3 @@ class TestVerifyTermsPreserved:
         translated = "हम Algorithm approach का अध्ययन करते हैं।"
         missing = verify_terms_preserved(original, translated, glossary)
         assert isinstance(missing, list)
-
-
-class TestDynamicGlossaryGeneration:
-    """Test the LLM-based dynamic glossary generation."""
-
-    def test_prompt_template_has_placeholder(self):
-        """The prompt template must contain the {transcript_text} placeholder."""
-        assert "{transcript_text}" in _GLOSSARY_PROMPT
-
-    def test_max_transcript_chars_reasonable(self):
-        assert 1_000 < _MAX_TRANSCRIPT_CHARS < 50_000
-
-    def test_empty_segments_returns_empty(self):
-        """Empty transcript should produce an empty glossary."""
-        from src.transcriber import Segment
-        segs = [Segment(start=0, end=1, text=""), Segment(start=1, end=2, text="  ")]
-        glossary = generate_glossary_from_transcript(
-            segs, gemini_api_key="fake-key-not-used",
-            fallback_to_static=False,
-        )
-        assert isinstance(glossary, Glossary)
-        assert len(glossary.terms) == 0
-
-    def test_no_api_key_falls_back_to_static(self):
-        """Without an API key, should fall back to the static glossary."""
-        from src.transcriber import Segment
-        segments = [Segment(start=0, end=5, text="The merge sort algorithm is O(n log n).")]
-        glossary = generate_glossary_from_transcript(
-            segments, gemini_api_key="", fallback_to_static=True,
-        )
-        assert isinstance(glossary, Glossary)
-        assert len(glossary.terms) > 0  # static glossary loaded
-
-    def test_no_api_key_no_fallback_returns_empty(self):
-        """Without an API key and no fallback, should return empty glossary."""
-        from src.transcriber import Segment
-        segments = [Segment(start=0, end=5, text="Binary search uses a sorted array.")]
-        glossary = generate_glossary_from_transcript(
-            segments, gemini_api_key="", fallback_to_static=False,
-        )
-        assert isinstance(glossary, Glossary)
-        # With fallback disabled and no key, we get an empty Glossary
-        assert len(glossary.terms) == 0
-
-    @patch("google.genai.Client")
-    def test_successful_api_call(self, MockClient):
-        """Mocked LLM call should produce a glossary from the returned terms."""
-        from src.transcriber import Segment
-
-        mock_response = MagicMock()
-        mock_response.text = '["merge sort", "binary search", "HashMap", "O(n log n)"]'
-        mock_client = MockClient.return_value
-        mock_client.models.generate_content.return_value = mock_response
-
-        segments = [
-            Segment(start=0, end=5, text="Merge sort is a divide and conquer algorithm."),
-            Segment(start=5, end=10, text="Binary search on a sorted array runs in O(n log n)."),
-        ]
-        glossary = generate_glossary_from_transcript(
-            segments, gemini_api_key="test-key", fallback_to_static=False,
-        )
-        assert isinstance(glossary, Glossary)
-        assert "merge sort" in glossary.terms
-        assert "binary search" in glossary.terms
-        assert "HashMap" in glossary.terms
-
-    @patch("google.genai.Client")
-    def test_api_returns_markdown_fenced_json(self, MockClient):
-        """Handle the common case where the LLM wraps JSON in markdown fences."""
-        from src.transcriber import Segment
-
-        mock_response = MagicMock()
-        mock_response.text = '```json\n["API", "REST", "HTTP"]\n```'
-        mock_client = MockClient.return_value
-        mock_client.models.generate_content.return_value = mock_response
-
-        segs = [Segment(start=0, end=3, text="REST API over HTTP")]
-        glossary = generate_glossary_from_transcript(
-            segs, gemini_api_key="test-key", fallback_to_static=False,
-        )
-        assert "API" in glossary.terms
-        assert "REST" in glossary.terms
-
-    @patch("google.genai.Client")
-    def test_api_failure_falls_back(self, MockClient):
-        """If the API call raises, should fall back to static glossary."""
-        from src.transcriber import Segment
-
-        MockClient.side_effect = RuntimeError("API down")
-
-        segs = [Segment(start=0, end=3, text="Binary search algorithm")]
-        glossary = generate_glossary_from_transcript(
-            segs, gemini_api_key="test-key", fallback_to_static=True,
-        )
-        # Should have fallen back to static glossary
-        assert isinstance(glossary, Glossary)
-        assert len(glossary.terms) > 0
-
-    @patch("google.genai.Client")
-    def test_api_failure_no_fallback_raises(self, MockClient):
-        """If the API call raises and fallback is off, should re-raise."""
-        from src.transcriber import Segment
-
-        MockClient.side_effect = RuntimeError("API down")
-
-        segs = [Segment(start=0, end=3, text="Binary search")]
-        with pytest.raises(RuntimeError, match="API down"):
-            generate_glossary_from_transcript(
-                segs, gemini_api_key="test-key", fallback_to_static=False,
-            )
-
-    def test_transcript_truncation(self):
-        """Long transcripts should be truncated to _MAX_TRANSCRIPT_CHARS."""
-        from src.transcriber import Segment
-
-        # Create segments that far exceed the limit
-        long_text = "algorithm " * 5000  # ~50,000 chars
-        segs = [Segment(start=0, end=600, text=long_text)]
-
-        # With no API key, falls back – but we can check it doesn't crash
-        glossary = generate_glossary_from_transcript(
-            segs, gemini_api_key="", fallback_to_static=True,
-        )
-        assert isinstance(glossary, Glossary)
-
-    @patch("google.genai.Client")
-    def test_api_returns_non_array_falls_back(self, MockClient):
-        """If the LLM returns a JSON object instead of array, should handle it."""
-        from src.transcriber import Segment
-
-        mock_response = MagicMock()
-        mock_response.text = '{"terms": ["oops"]}'  # not a plain array
-        mock_client = MockClient.return_value
-        mock_client.models.generate_content.return_value = mock_response
-
-        segs = [Segment(start=0, end=3, text="Some lecture text")]
-        glossary = generate_glossary_from_transcript(
-            segs, gemini_api_key="test-key", fallback_to_static=True,
-        )
-        # Should fall back because format was wrong
-        assert isinstance(glossary, Glossary)
-        assert len(glossary.terms) > 0  # static fallback

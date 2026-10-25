@@ -31,7 +31,8 @@ from config.settings import (
     SARVAM_TRANSLATION_MODE,
 )
 from src.transcriber import Segment
-from src.glossary import Glossary, generate_glossary_from_transcript, load_default_glossary, verify_terms_preserved
+from src.filler_detector import get_text_without_fillers
+from src.glossary import Glossary, load_default_glossary, verify_terms_preserved
 from src.utils import retry_on_failure
 
 logger = logging.getLogger("nptel_pipeline")
@@ -94,11 +95,27 @@ def translate_segments(
     if target_langs is None:
         target_langs = list(TARGET_LANGUAGES.keys())
 
-    # Auto-generate dynamic glossary from transcript if not provided
+    # Hesitation fillers ("ah", "um") must not reach the translator: Sarvam's
+    # code-mixed mode leaves the phrase around them untranslated, and any
+    # filler that survives ends up in the subtitles and the dubbed speech.
+    # Segments that were nothing but fillers come back with empty text, at
+    # the same index, so the output still lines up with *segments*.
+    all_segments = segments
+    cleaned = [get_text_without_fillers(s.text) for s in all_segments]
+    speech_idx = [i for i, text in enumerate(cleaned) if text]
+    segments = [
+        Segment(start=all_segments[i].start, end=all_segments[i].end, text=cleaned[i])
+        for i in speech_idx
+    ]
+    n_changed = sum(1 for s, c in zip(all_segments, cleaned) if c != s.text.strip())
+    if n_changed:
+        logger.info("Removed filler words from %d/%d segments before translation",
+                    n_changed, len(all_segments))
+
+    # Static term list for the GCP / Gemini paths (Sarvam code-mixed mode
+    # keeps technical terms in English on its own and ignores it)
     if glossary is None and ENABLE_CODE_MIXING:
-        glossary = generate_glossary_from_transcript(
-            segments, fallback_to_static=True,
-        )
+        glossary = load_default_glossary()
 
     # Extract terms actually used in the transcript for focused prompts
     terms_in_use: list[str] = []
@@ -125,7 +142,10 @@ def translate_segments(
             )
         else:
             raise ValueError(f"Unknown translation method: {method}")
-        return lang, translated
+        full = [Segment(start=s.start, end=s.end, text="") for s in all_segments]
+        for i, seg in zip(speech_idx, translated):
+            full[i] = seg
+        return lang, full
 
     # Translate languages concurrently
     if len(target_langs) > 1 and method == "sarvam":

@@ -1405,7 +1405,7 @@ def _synth_segments_gcptts(
     failed = 0
 
     for idx, seg in enumerate(segments):
-        text = seg.text if preserve_fillers else get_text_without_fillers(seg)
+        text = seg.text if preserve_fillers else get_text_without_fillers(seg.text)
         text = text.strip()
         if not text:
             continue
@@ -1663,7 +1663,7 @@ def _synth_segments_xtts(
     try:
         for idx, seg in enumerate(segments):
             out_path = os.path.join(out_dir, f"segment_{idx:03d}.wav")
-            text = seg.text if preserve_fillers else get_text_without_fillers(seg)
+            text = seg.text if preserve_fillers else get_text_without_fillers(seg.text)
             text = text.replace(".", " ").strip()
             if not text:
                 continue

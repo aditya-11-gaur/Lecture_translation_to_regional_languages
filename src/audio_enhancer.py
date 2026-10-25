@@ -75,11 +75,8 @@ def apply_neural_enhancement(input_path: str) -> str:
     base, _ = os.path.splitext(input_path)
     output_path = base + "_enhanced.wav"
 
-    if os.path.exists(output_path):
-        logger.info("Enhancer: cached output found, skipping (%s)",
-                    os.path.basename(output_path))
-        return output_path
-
+    # No reuse of an existing output: the input track is regenerated on every
+    # run, so a file left by an earlier run would hold the old audio.
     logger.info("Enhancing audio with DeepFilterNet3: %s",
                 os.path.basename(input_path))
     try:

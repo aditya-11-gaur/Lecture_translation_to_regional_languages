@@ -120,3 +120,15 @@ class TestGetTextWithTargetFillers:
         text = "Um, hello."
         result = get_text_with_target_fillers(text, "xx")
         assert isinstance(result, str)
+
+
+class TestFillerRemovalKeepsSentenceEnds:
+
+    def test_sentence_end_moves_to_previous_word(self):
+        assert get_text_without_fillers("This is the result ah. Next we") == "This is the result. Next we"
+
+    def test_mid_sentence_filler_and_its_comma_removed(self):
+        assert get_text_without_fillers("So, ah, the algorithm works") == "So, the algorithm works"
+
+    def test_filler_only_text_becomes_empty(self):
+        assert get_text_without_fillers("Ah.") == ""
