@@ -375,7 +375,8 @@ def build_pipeline_dag(
             def lipsync(ctx):
                 ls_dir = os.path.join(output_dir, "lipsync")
                 os.makedirs(ls_dir, exist_ok=True)
-                processor = LipSyncProcessor(debug_dir=os.path.join(output_dir, "lipsync_debug"))
+                # Face boxes are cached here and reused by the other languages
+                processor = LipSyncProcessor(face_cache_dir=ls_dir)
                 result = processor.sync(video_path, ctx[f"audio:{lc}"],
                                         os.path.join(ls_dir, f"lipsync_{lc}.mp4"), lc)
                 ctx[f"lipsync:{lc}"] = result

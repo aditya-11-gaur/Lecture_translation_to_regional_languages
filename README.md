@@ -31,7 +31,7 @@ extract (CPU) ─ demucs (GPU) ─ stt: Whisper (GPU) ─ subtitles_en (CPU)
 | Text-to-speech | Sarvam `bulbul:v3`, Google Cloud TTS Neural2, or Coqui XTTS v2 — voice picked to match the lecturer's gender |
 | Voice cloning | OpenVoice v2 (needs a CUDA GPU) |
 | Alignment | One natural speaking speed (±8–15 % WSOLA nudges via ffmpeg `atempo`); pauses absorb timing differences; sentences start at the real speech onset; loudness evened out |
-| Lip sync | Wav2Lip |
+| Lip sync | Wav2Lip model, own pipeline (`src/lipsync_worker.py`): frame-exact, only the mouth/jaw regenerated and feather-blended, faces detected once per video, single CRF 18 encode |
 
 Hesitation fillers ("ah", "um") are removed before translation and from the subtitles.
 A failure in one language only drops that language; the job fails if a shared stage
